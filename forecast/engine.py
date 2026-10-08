@@ -5,16 +5,40 @@ import datetime as dt
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 
-LABOR_PENSION_WAGE_CAP = 150_000  # 勞退提繳工資上限
+LABOR_PENSION_WAGE_CAP = 150_000  # 勞退提繳工資上限（預設，可在設定中調整）
+
+
+@dataclass
+class Stage:
+    """投資時間段（以年齡計，含起不含迄）。"""
+    start_age: float = 0.0
+    end_age: float = 120.0
+    annual_return: float = 5.0   # 該段預期年均報酬率 %
+    monthly_add: float = 0.0     # 該段每月增額（僅退休前有效）
+
+
+def stage_at(stages: list, age: float) -> tuple:
+    """回傳 (年報酬率 %, 每月增額)。時間段之外：沿用最近一段的報酬率並停止加碼。"""
+    if not stages:
+        return 0.0, 0.0
+    for st in stages:
+        if st.start_age <= age < st.end_age:
+            return st.annual_return, st.monthly_add
+    prev = [st for st in stages if st.end_age <= age]
+    if prev:
+        return max(prev, key=lambda x: x.end_age).annual_return, 0.0
+    return min(stages, key=lambda x: x.start_age).annual_return, 0.0
 
 
 @dataclass
 class Account:
     name: str = "投資帳戶"
     cash: float = 0.0            # 目前現金/本金
-    monthly_add: float = 0.0     # 每月增額
-    annual_return: float = 5.0   # 預期年均報酬率 %
-    years: float = 20.0          # 投資(加碼)年限；期滿後停止加碼但持續複利
+    stages: list = field(default_factory=list)  # list[Stage]
+
+    @staticmethod
+    def simple(name, cash, monthly_add, annual_return, years, start_age=0.0):
+        return Account(name, cash, [Stage(start_age, start_age + years, annual_return, monthly_add)])
 
 
 @dataclass
@@ -43,15 +67,18 @@ class Settings:
     gains_tax_rate: float = 0.0         # 投資獲利稅率 %
     savings_cash: float = 0.0           # 活存/未投入現金
     savings_rate: float = 1.0           # 活存年利率 %
+    bucket_amount: float = 1_800_000    # 退休後「生活費帳戶」每年年初補足到此金額（今日幣值，隨通膨調整）
     # 勞退新制
     lp_enabled: bool = True
-    lp_wage: float = 0.0                # 提繳工資；0 = 取月收入（上限 150,000）
+    lp_wage: float = 0.0                # 提繳工資；0 = 取月收入
+    lp_wage_cap: float = LABOR_PENSION_WAGE_CAP  # 提繳工資上限
     lp_employer_pct: float = 6.0
     lp_self_pct: float = 0.0            # 自提 0~6%
     lp_balance: float = 0.0             # 帳戶現有餘額
     lp_return: float = 3.0              # 帳戶年收益率 %
     lp_claim_age: float = 65
-    lp_lump_sum: bool = False           # True 一次領；False 月領
+    lp_lump_sum: bool = True            # True 一次領（轉入退休金帳戶）；False 月領
+    lump_stages: list = field(default_factory=lambda: [Stage(0.0, 120.0, 4.0, 0.0)])  # 退休金帳戶投資階段
     # 勞保老年年金
     li_enabled: bool = True
     li_avg_wage: float = 45_800         # 平均月投保薪資
@@ -66,14 +93,26 @@ def to_dict(s: Settings) -> dict:
     return asdict(s)
 
 
+def _stages(lst) -> list:
+    return [Stage(**{k: v for k, v in d.items() if k in Stage.__dataclass_fields__}) for d in lst]
+
+
 def from_dict(d: dict) -> Settings:
     s = Settings()
     for k, v in d.items():
-        if k in ("accounts", "loans") or not hasattr(s, k):
+        if k in ("accounts", "loans", "lump_stages") or not hasattr(s, k):
             continue
         setattr(s, k, v)
-    s.accounts = [Account(**{k: v for k, v in a.items() if k in Account.__dataclass_fields__})
-                  for a in d.get("accounts", [])]
+    if "lump_stages" in d:
+        s.lump_stages = _stages(d["lump_stages"])
+    s.accounts = []
+    for a in d.get("accounts", []):
+        if "stages" in a:  # 新格式
+            s.accounts.append(Account(a.get("name", "投資帳戶"), a.get("cash", 0.0), _stages(a["stages"])))
+        else:  # 舊格式：單一報酬率 + 投資年限
+            s.accounts.append(Account.simple(a.get("name", "投資帳戶"), a.get("cash", 0.0),
+                                             a.get("monthly_add", 0.0), a.get("annual_return", 5.0),
+                                             a.get("years", 20.0), s.current_age))
     s.loans = [Loan(**{k: v for k, v in l.items() if k in Loan.__dataclass_fields__})
                for l in d.get("loans", [])]
     return s
@@ -128,8 +167,12 @@ def validate(s: Settings) -> list[str]:
         errs.append("退休年齡不可小於目前年齡")
     if s.retire_age > s.life_expectancy:
         errs.append("退休年齡不可大於預期壽命")
-    if not 0 <= s.lp_self_pct <= 6:
-        errs.append("勞退自提比例需介於 0~6%")
+    if not 0 <= s.lp_self_pct <= 100:
+        errs.append("個人提繳比例需介於 0~100%")
+    for a in list(s.accounts) + [Account("退休金帳戶", 0, s.lump_stages)]:
+        for st in a.stages:
+            if st.end_age <= st.start_age:
+                errs.append(f"帳戶「{a.name}」的時間段結束年齡需大於起始年齡")
     for l in s.loans:
         try:
             a, b = parse_ym(l.start), parse_ym(l.end)
@@ -155,6 +198,7 @@ class Row:
     invested: float          # 該年新增投資
     account_balances: list
     free_cash: float
+    bucket: float            # 退休生活費帳戶
     lp_balance: float
     loan_balance: float
     net_worth: float
@@ -187,10 +231,15 @@ def simulate(s: Settings, today: Optional[dt.date] = None) -> Result:
     gt = 1 - s.gains_tax_rate / 100
 
     # 帳戶
-    bal = [a.cash for a in s.accounts]
-    acc_rate = [monthly_rate(a.annual_return) for a in s.accounts]
-    acc_add_m = [min(int(round(a.years * 12)), retire_m) for a in s.accounts]
+    accs = list(s.accounts)
+    lump_idx = None
+    if s.lp_enabled and s.lp_lump_sum:  # 勞退一次領 → 退休金帳戶（排在投資帳戶之後）
+        accs.append(Account("退休金帳戶", 0.0, s.lump_stages))
+        lump_idx = len(accs) - 1
+    n_real = len(s.accounts)
+    bal = [a.cash for a in accs]
     free = s.savings_cash
+    bucket = 0.0   # 退休生活費帳戶
     free_rate = monthly_rate(s.savings_rate)
 
     # 勞退
@@ -260,20 +309,57 @@ def simulate(s: Settings, today: Optional[dt.date] = None) -> Result:
     surplus_now = None
     gross0 = s.monthly_income
 
+    def draw(need, free_first):
+        """依序從活存/投資帳戶提領，回傳實際領到的金額。"""
+        nonlocal free
+        got = 0.0
+        if free_first:
+            t_ = min(max(free, 0.0), need)
+            free -= t_
+            got += t_
+        for i in range(len(bal)):
+            if got >= need:
+                break
+            t_ = min(bal[i], need - got)
+            bal[i] -= t_
+            got += t_
+        if not free_first and got < need:
+            t_ = min(max(free, 0.0), need - got)
+            free -= t_
+            got += t_
+        return got
+
+    def refill(m_next):
+        """每年年初：從投資帳戶依序提領，將生活費帳戶補足到設定金額（隨通膨調整）。"""
+        nonlocal bucket
+        target = s.bucket_amount * infl_m ** m_next
+        if bucket < target:
+            bucket += draw(target - bucket, False)
+
+    if retire_m == 0:
+        refill(0)
+
     for m in range(total_m):
         yr = m // 12
+        age = s.current_age + m / 12
         retired = m >= retire_m
         # 未來才開始的 amort 貸款：到期初放入本金
         for ls in loan_sched:
             if ls["amort"] and "_future_principal" in ls and now_abs + m == ls["a"]:
                 ls["bal"] = ls.pop("_future_principal")
 
-        # 報酬（先複利）
+        # 報酬（先複利）；各帳戶依所在時間段取報酬率與加碼額
+        adds = [0.0] * len(bal)
         for i in range(len(bal)):
+            rate, add = stage_at(accs[i].stages, age)
             if bal[i] > 0:
-                bal[i] += bal[i] * acc_rate[i] * gt
+                bal[i] += bal[i] * monthly_rate(rate) * gt
+            if i < n_real:
+                adds[i] = add
         if free > 0:
             free += free * free_rate * gt
+        if bucket > 0:
+            bucket += bucket * free_rate * gt
         if lp > 0:
             lp += lp * lp_r
 
@@ -284,9 +370,8 @@ def simulate(s: Settings, today: Optional[dt.date] = None) -> Result:
             gross = gross0 * (1 + s.income_growth / 100) ** yr
             net_salary = gross * (1 - s.income_tax_rate / 100)
             if s.lp_enabled:
-                wage = min(s.lp_wage if s.lp_wage > 0 else gross, LABOR_PENSION_WAGE_CAP)
-                if s.lp_wage > 0:
-                    wage = min(s.lp_wage * (1 + s.income_growth / 100) ** yr, LABOR_PENSION_WAGE_CAP)
+                base = s.lp_wage * (1 + s.income_growth / 100) ** yr if s.lp_wage > 0 else gross
+                wage = min(base, s.lp_wage_cap)
                 lp += wage * s.lp_employer_pct / 100
                 self_contrib = wage * s.lp_self_pct / 100
                 lp += self_contrib
@@ -297,7 +382,7 @@ def simulate(s: Settings, today: Optional[dt.date] = None) -> Result:
         if lp_enabled and m == claim_m:
             lp_at_claim = lp
             if s.lp_lump_sum:
-                free += lp
+                bal[lump_idx] += lp
                 lp = 0.0
                 lp_enabled = False
             else:
@@ -315,34 +400,41 @@ def simulate(s: Settings, today: Optional[dt.date] = None) -> Result:
         expense = (s.retire_expense if retired else s.monthly_expense) * infl
         loan_paid, loan_bal = loan_state(m)
 
-        # 投資加碼
         invested = 0.0
         if not retired:
-            for i, a in enumerate(s.accounts):
-                if m < acc_add_m[i]:
-                    bal[i] += a.monthly_add
-                    invested += a.monthly_add
+            for i in range(n_real):
+                bal[i] += adds[i]
+                invested += adds[i]
 
-        cash_flow = net_salary + pension - expense - loan_paid - invested
-        if m == 0:
-            surplus_now = cash_flow
-        if cash_flow >= 0:
-            free += cash_flow
+        if not retired:
+            cash_flow = net_salary + pension - expense - loan_paid - invested
+            if m == 0:
+                surplus_now = cash_flow
+            if cash_flow >= 0:
+                free += cash_flow
+            else:
+                need = -cash_flow
+                need -= draw(need, True)
+                if need > 1e-6:
+                    free -= need  # 負債（資金耗盡後的缺口）
+                    if depleted is None:
+                        depleted = age
         else:
-            need = -cash_flow
-            take = min(max(free, 0.0), need)
-            free -= take
-            need -= take
-            for i in range(len(bal)):
-                if need <= 0:
-                    break
-                t = min(bal[i], need)
-                bal[i] -= t
-                need -= t
-            if need > 1e-6:
-                free -= need  # 負債（資金耗盡後的缺口）
-                if depleted is None:
-                    depleted = s.current_age + m / 12
+            if m == 0:
+                surplus_now = pension - expense - loan_paid
+            bucket += pension - expense - loan_paid
+            if bucket < 0:
+                need = -bucket
+                bucket = 0.0
+                need -= draw(need, False)
+                if need > 1e-6:
+                    bucket -= need
+                    if depleted is None:
+                        depleted = age
+
+        if retired or m + 1 >= retire_m:
+            if (m + 1 - retire_m) % 12 == 0 and m + 1 < total_m:
+                refill(m + 1)
 
         y_income += net_salary
         y_pension += pension
@@ -351,27 +443,28 @@ def simulate(s: Settings, today: Optional[dt.date] = None) -> Result:
         y_inv += invested
 
         if (m + 1) % 12 == 0 or m == total_m - 1:
-            nw = sum(bal) + free + lp - loan_bal
+            nw = sum(bal) + free + bucket + lp - loan_bal
             real = nw / (infl_m ** (m + 1))
             rows.append(Row(
                 age=round(s.current_age + (m + 1) / 12, 2),
                 income=y_income, pension_income=y_pension, expense=y_exp,
                 loan_paid=y_loan, invested=y_inv,
-                account_balances=list(bal), free_cash=free, lp_balance=lp,
+                account_balances=list(bal), free_cash=free, bucket=bucket, lp_balance=lp,
                 loan_balance=loan_bal, net_worth=nw, real_net_worth=real))
             y_income = y_pension = y_exp = y_loan = y_inv = 0.0
         if m + 1 == retire_m:
-            retire_nw = sum(bal) + free + lp - loan_bal
+            retire_nw = sum(bal) + free + bucket + lp - loan_bal
             retire_real = retire_nw / (infl_m ** (m + 1))
 
     if retire_m == 0:
         retire_nw = sum(a.cash for a in s.accounts) + s.savings_cash + s.lp_balance
         retire_real = retire_nw
+        retire_real = retire_nw
     if s.lp_enabled and s.lp_claim_age < s.retire_age:
         warnings.append("勞退請領年齡早於退休年齡，已視為退休時才請領")
     if surplus_now is not None and surplus_now < 0 and s.retire_age > s.current_age:
         warnings.append("目前每月現金流為負，不足部分會動用活存/投資帳戶")
-    return Result(rows=rows, account_names=[a.name for a in s.accounts],
+    return Result(rows=rows, account_names=[a.name for a in accs],
                   retire_net_worth=retire_nw, retire_real_net_worth=retire_real,
                   depleted_age=depleted, li_monthly=li_pay, lp_monthly=lp_pay,
                   lp_at_claim=lp_at_claim, monthly_surplus_now=surplus_now or 0.0,
