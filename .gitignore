@@ -3,3 +3,4 @@ build/
 dist/
 *.spec
 retirement_settings.json
+tests/_smoke_settings.json

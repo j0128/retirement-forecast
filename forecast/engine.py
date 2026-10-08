@@ -54,13 +54,52 @@ class Loan:
 
 
 @dataclass
+class ExtraIncome:
+    """額外收入（兼職、租金、股利…）。金額以名目計，年金額平均分攤到每月。"""
+    name: str = "額外收入"
+    amount: float = 0.0
+    freq: str = "month"          # month / year
+    start_age: float = 0.0
+    end_age: float = 65.0        # 含起不含迄
+    growth: float = 0.0          # 每年成長 %
+    taxable: bool = True         # 是否計入年度所得稅
+
+
+@dataclass
+class Insurance:
+    """保險：保費有期限，可有滿期金。"""
+    name: str = "保險"
+    premium: float = 0.0
+    freq: str = "month"          # month / year（年繳於保單年度起始月扣款）
+    start_age: float = 0.0
+    end_age: float = 65.0        # 繳費期間含起不含迄
+    inflation_adjust: bool = False
+    payout: float = 0.0          # 滿期金/理賠金（名目）
+    payout_age: float = 0.0      # 領取年齡；0 = 繳費結束年齡
+    payout_to: str = ""          # 入帳帳戶名稱；空白或找不到 = 活存
+
+
+@dataclass
+class Property:
+    """不動產：計入淨資產，可設定出售並償還綁定貸款。"""
+    name: str = "自住房"
+    value: float = 0.0           # 目前市值
+    appreciation: float = 2.0    # 年增值率 %
+    sell_age: float = 0.0        # 0 = 不出售
+    sell_cost: float = 4.0       # 交易成本 %（仲介、稅費）
+    loan_name: str = ""          # 出售時一併還清的貸款（名稱）
+    proceeds_to: str = ""        # 售屋款入帳帳戶；空白或找不到 = 活存
+
+
+@dataclass
 class Settings:
     current_age: float = 35
     retire_age: float = 65
     life_expectancy: float = 90
-    monthly_income: float = 60_000      # 稅前月均收入
-    income_growth: float = 2.0          # 每年調薪 %
-    income_tax_rate: float = 5.0        # 所得稅有效稅率 %
+    salary_net: float = 57_000          # 實領月薪（已扣勞健保、預扣稅、自提）
+    salary_withheld: float = 3_000      # 每月預扣所得稅（稅款準備金；每年 5 月結算）
+    income_growth: float = 2.0          # 每年調薪 %（實領與預扣同步成長）
+    income_tax_rate: float = 5.0        # 年度結算有效稅率 %（課稅所得 = 薪資 + 應稅額外收入）
     monthly_expense: float = 30_000     # 目前每月生活支出（今日幣值）
     retire_expense: float = 30_000      # 退休後每月生活支出（今日幣值）
     inflation: float = 2.0              # 通膨率 %
@@ -86,8 +125,16 @@ class Settings:
     li_years_now: float = 0.0           # 目前已投保年資
     li_claim_age: float = 65
     li_manual_monthly: float = 0.0      # >0 則直接採用此金額（以 65 歲請領為基準）
+    # 退休後醫療費用
+    medical_start_age: float = 70
+    medical_monthly: float = 5_000      # 起始年齡時每月醫療費用（今日幣值）
+    medical_growth: float = 2.0         # 醫療費用高於一般通膨的年增幅 %
+    scenario_delta: float = 2.0         # 悲觀/樂觀情境：投資帳戶報酬率 ∓ 百分點
     accounts: list = field(default_factory=list)
     loans: list = field(default_factory=list)
+    extra_incomes: list = field(default_factory=list)
+    insurances: list = field(default_factory=list)
+    properties: list = field(default_factory=list)
 
 
 def to_dict(s: Settings) -> dict:
@@ -98,12 +145,23 @@ def _stages(lst) -> list:
     return [Stage(**{k: v for k, v in d.items() if k in Stage.__dataclass_fields__}) for d in lst]
 
 
+def _objs(cls, lst) -> list:
+    return [cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__}) for d in lst or []]
+
+
 def from_dict(d: dict) -> Settings:
     s = Settings()
     for k, v in d.items():
-        if k in ("accounts", "loans", "lump_stages") or not hasattr(s, k):
+        if k in ("accounts", "loans", "lump_stages", "extra_incomes", "insurances", "properties") \
+                or not hasattr(s, k):
             continue
         setattr(s, k, v)
+    if "monthly_income" in d and "salary_net" not in d:  # 舊格式：稅前月薪 + 稅率
+        gross, rate = d["monthly_income"], d.get("income_tax_rate", 5.0)
+        s.salary_net, s.salary_withheld = gross * (1 - rate / 100), gross * rate / 100
+    s.extra_incomes = _objs(ExtraIncome, d.get("extra_incomes"))
+    s.insurances = _objs(Insurance, d.get("insurances"))
+    s.properties = _objs(Property, d.get("properties"))
     if "lump_stages" in d:
         s.lump_stages = _stages(d["lump_stages"])
     s.accounts = []
@@ -174,6 +232,12 @@ def validate(s: Settings) -> list[str]:
         for st in a.stages:
             if st.end_age <= st.start_age:
                 errs.append(f"帳戶「{a.name}」的時間段結束年齡需大於起始年齡")
+    for x in s.extra_incomes:
+        if x.end_age <= x.start_age:
+            errs.append(f"額外收入「{x.name}」結束年齡需大於起始年齡")
+    for x in s.insurances:
+        if x.end_age <= x.start_age:
+            errs.append(f"保險「{x.name}」結束年齡需大於起始年齡")
     for l in s.loans:
         try:
             a, b = parse_ym(l.start), parse_ym(l.end)
@@ -192,9 +256,13 @@ def validate(s: Settings) -> list[str]:
 @dataclass
 class Row:
     age: float
-    income: float            # 該年稅後薪資收入
+    income: float            # 該年實領薪資
     pension_income: float    # 該年勞保年金 + 勞退月領
     expense: float           # 該年生活支出
+    extra_income: float      # 該年額外收入
+    insurance: float         # 該年保險保費
+    medical: float           # 該年醫療費用
+    tax_settle: float        # 該年稅款結算（正 = 退稅，負 = 補稅）
     loan_paid: float
     invested: float          # 該年新增投資
     account_balances: list
@@ -202,8 +270,10 @@ class Row:
     bucket: float            # 退休生活費帳戶
     lp_balance: float
     loan_balance: float
-    net_worth: float
+    property_value: float    # 不動產市值
+    net_worth: float         # 含不動產
     real_net_worth: float
+    liquid_net_worth: float  # 不含不動產
 
 
 @dataclass
@@ -220,7 +290,7 @@ class Result:
     warnings: list
 
 
-def simulate(s: Settings, today: Optional[dt.date] = None) -> Result:
+def simulate(s: Settings, today: Optional[dt.date] = None, return_delta: float = 0.0) -> Result:
     today = today or dt.date.today()
     errs = validate(s)
     if errs:
@@ -262,12 +332,12 @@ def simulate(s: Settings, today: Optional[dt.date] = None) -> Result:
         if l.mode == "amort":
             n = (b - a + 1) if b is not None else int(round(l.years * 12))
             pay = annuity_payment(l.principal, l.annual_rate, n)
-            loan_sched.append({"a": a, "n": n, "pay": pay, "bal": l.principal,
-                               "r": l.annual_rate / 100 / 12, "amort": True})
+            loan_sched.append({"a": a, "n": n, "pay": pay, "bal": l.principal, "name": l.name,
+                               "r": l.annual_rate / 100 / 12, "amort": True, "cancelled": False})
         else:
             n = b - a + 1
-            loan_sched.append({"a": a, "n": n, "pay": l.monthly_payment, "bal": 0.0,
-                               "r": 0.0, "amort": False})
+            loan_sched.append({"a": a, "n": n, "pay": l.monthly_payment, "bal": 0.0, "name": l.name,
+                               "r": 0.0, "amort": False, "cancelled": False})
     # 追趕：amort 貸款在「今天」之前已還款的期數，讓餘額正確
     for ls in loan_sched:
         if ls["amort"]:
@@ -280,12 +350,16 @@ def simulate(s: Settings, today: Optional[dt.date] = None) -> Result:
         """回傳 (本月扣款, 貸款餘額)，並推進 amort 餘額。"""
         paid, balance = 0.0, 0.0
         for ls in loan_sched:
+            if ls["cancelled"]:
+                continue
             k = now_abs + m - ls["a"]  # 第 k 期（0 起算）
             if 0 <= k < ls["n"]:
                 paid += ls["pay"]
                 if ls["amort"]:
                     ls["bal"] = max(ls["bal"] * (1 + ls["r"]) - ls["pay"], 0.0)
         for ls in loan_sched:
+            if ls["cancelled"]:
+                continue
             k = now_abs + m - ls["a"]
             if ls["amort"]:
                 balance += ls["bal"]
@@ -302,13 +376,35 @@ def simulate(s: Settings, today: Optional[dt.date] = None) -> Result:
             ls["_future_principal"] = ls["bal"]
             ls["bal"] = 0.0
 
+    def loan_remaining(ls, m):
+        """出售不動產時需還清的貸款餘額（fixed 貸款以剩餘應付總額估算）。"""
+        if ls["cancelled"]:
+            return 0.0
+        if ls["amort"]:
+            return ls["bal"] if now_abs + m >= ls["a"] else ls["bal"] + ls.get("_future_principal", 0.0)
+        k = now_abs + m - ls["a"]
+        return max(ls["n"] - max(k, 0), 0) * ls["pay"]
+
     warnings = []
     rows = []
     depleted = None
     y_income = y_pension = y_exp = y_loan = y_inv = 0.0
+    y_extra = y_ins = y_med = y_tax = 0.0
     retire_nw = retire_real = 0.0
     surplus_now = None
-    gross0 = s.monthly_income
+    names = [a.name for a in accs]
+    tax_year: dict = {}          # 日曆年 -> [已預扣, 課稅所得]
+    prop_sold = [False] * len(s.properties)
+    sale_m = [int(round((p_.sell_age - s.current_age) * 12)) if p_.sell_age > 0 else None
+              for p_ in s.properties]
+
+    def credit(amount, dest):
+        """將款項存入指定帳戶；找不到帳戶則存入活存。"""
+        nonlocal free
+        if dest in names:
+            bal[names.index(dest)] += amount
+        else:
+            free += amount
 
     def draw(need, free_first):
         """依序從活存/投資帳戶提領，回傳實際領到的金額。"""
@@ -353,6 +449,7 @@ def simulate(s: Settings, today: Optional[dt.date] = None) -> Result:
         adds = [0.0] * len(bal)
         for i in range(len(bal)):
             rate, add = stage_at(accs[i].stages, age)
+            rate += return_delta
             if bal[i] > 0:
                 bal[i] += bal[i] * monthly_rate(rate) * gt
             if i < n_real:
@@ -364,19 +461,34 @@ def simulate(s: Settings, today: Optional[dt.date] = None) -> Result:
         if lp > 0:
             lp += lp * lp_r
 
-        # 收入
-        net_salary = 0.0
-        self_contrib = 0.0
+        # 收入：實領薪水（預扣所得稅另列入稅款準備金）、額外收入
+        cal_year = today.year + (today.month - 1 + m) // 12
+        cal_month = (today.month - 1 + m) % 12 + 1
+        net_salary = withheld = 0.0
+        taxable_inc = 0.0
         if not retired:
-            gross = gross0 * (1 + s.income_growth / 100) ** yr
-            net_salary = gross * (1 - s.income_tax_rate / 100)
+            gf = (1 + s.income_growth / 100) ** yr
+            net_salary = s.salary_net * gf
+            withheld = s.salary_withheld * gf
+            taxable_inc = net_salary + withheld
             if s.lp_enabled:
-                base = s.lp_wage * (1 + s.income_growth / 100) ** yr if s.lp_wage > 0 else gross
+                base = s.lp_wage * gf if s.lp_wage > 0 else net_salary + withheld
                 wage = min(base, s.lp_wage_cap)
-                lp += wage * s.lp_employer_pct / 100
-                self_contrib = wage * s.lp_self_pct / 100
-                lp += self_contrib
-                net_salary -= self_contrib
+                lp += wage * s.lp_employer_pct / 100 + wage * s.lp_self_pct / 100  # 自提已含在實領薪水的扣款中
+        extra = 0.0
+        for x in s.extra_incomes:
+            if x.start_age <= age < x.end_age:
+                amt = x.amount * (1 + x.growth / 100) ** max(age - x.start_age, 0) / (12 if x.freq == "year" else 1)
+                extra += amt
+                if x.taxable:
+                    taxable_inc += amt
+        ty = tax_year.setdefault(cal_year, [0.0, 0.0])
+        ty[0] += withheld
+        ty[1] += taxable_inc
+        tax_settle = 0.0
+        if cal_month == 5 and (cal_year - 1) in tax_year:  # 每年 5 月結算上一年度所得稅（多退少補）
+            w_, inc_ = tax_year.pop(cal_year - 1)
+            tax_settle = w_ - inc_ * s.income_tax_rate / 100
 
         # 雇主另給的退休金：退休當月進入退休金帳戶
         if s.employer_lump > 0 and m == retire_m:
@@ -403,6 +515,30 @@ def simulate(s: Settings, today: Optional[dt.date] = None) -> Result:
         # 支出
         infl = infl_m ** m
         expense = (s.retire_expense if retired else s.monthly_expense) * infl
+        medical = 0.0
+        if age >= s.medical_start_age and s.medical_monthly > 0:
+            medical = s.medical_monthly * infl * (1 + s.medical_growth / 100) ** (age - s.medical_start_age)
+
+        # 保險：保費、滿期金
+        insurance = 0.0
+        for x in s.insurances:
+            sm = int(round((x.start_age - s.current_age) * 12))
+            em = int(round((x.end_age - s.current_age) * 12))
+            if sm <= m < em and (x.freq != "year" or (m - sm) % 12 == 0):
+                insurance += x.premium * (infl if x.inflation_adjust else 1.0)
+            if x.payout > 0 and m == int(round(((x.payout_age or x.end_age) - s.current_age) * 12)):
+                credit(x.payout, x.payout_to)
+
+        # 不動產出售：售屋款扣交易成本與綁定貸款後入帳
+        for i, p_ in enumerate(s.properties):
+            if sale_m[i] is not None and m == sale_m[i] and not prop_sold[i]:
+                prop_sold[i] = True
+                proceeds = p_.value * (1 + p_.appreciation / 100) ** (m / 12) * (1 - p_.sell_cost / 100)
+                for ls in loan_sched:
+                    if p_.loan_name and ls["name"] == p_.loan_name:
+                        proceeds -= loan_remaining(ls, m)
+                        ls["cancelled"] = True
+                credit(proceeds, p_.proceeds_to)
         loan_paid, loan_bal = loan_state(m)
 
         invested = 0.0
@@ -411,8 +547,9 @@ def simulate(s: Settings, today: Optional[dt.date] = None) -> Result:
                 bal[i] += adds[i]
                 invested += adds[i]
 
+        outflow = expense + medical + insurance + loan_paid
         if not retired:
-            cash_flow = net_salary + pension - expense - loan_paid - invested
+            cash_flow = net_salary + extra + pension + tax_settle - outflow - invested
             if m == 0:
                 surplus_now = cash_flow
             if cash_flow >= 0:
@@ -426,8 +563,8 @@ def simulate(s: Settings, today: Optional[dt.date] = None) -> Result:
                         depleted = age
         else:
             if m == 0:
-                surplus_now = pension - expense - loan_paid
-            bucket += pension - expense - loan_paid
+                surplus_now = pension + extra - outflow
+            bucket += pension + extra + tax_settle - outflow
             if bucket < 0:
                 need = -bucket
                 bucket = 0.0
@@ -446,24 +583,37 @@ def simulate(s: Settings, today: Optional[dt.date] = None) -> Result:
         y_exp += expense
         y_loan += loan_paid
         y_inv += invested
+        y_extra += extra
+        y_ins += insurance
+        y_med += medical
+        y_tax += tax_settle
+
+        def prop_value(mm):
+            return sum(p_.value * (1 + p_.appreciation / 100) ** (mm / 12)
+                       for i, p_ in enumerate(s.properties) if not prop_sold[i])
 
         if (m + 1) % 12 == 0 or m == total_m - 1:
-            nw = sum(bal) + free + bucket + lp - loan_bal
-            real = nw / (infl_m ** (m + 1))
+            pv = prop_value(m + 1)
+            liquid = sum(bal) + free + bucket + lp - loan_bal
+            nw = liquid + pv
             rows.append(Row(
                 age=round(s.current_age + (m + 1) / 12, 2),
-                income=y_income, pension_income=y_pension, expense=y_exp,
+                income=y_income, pension_income=y_pension, expense=y_exp, extra_income=y_extra,
+                insurance=y_ins, medical=y_med, tax_settle=y_tax,
                 loan_paid=y_loan, invested=y_inv,
                 account_balances=list(bal), free_cash=free, bucket=bucket, lp_balance=lp,
-                loan_balance=loan_bal, net_worth=nw, real_net_worth=real))
+                loan_balance=loan_bal, property_value=pv, net_worth=nw,
+                real_net_worth=nw / (infl_m ** (m + 1)), liquid_net_worth=liquid))
             y_income = y_pension = y_exp = y_loan = y_inv = 0.0
+            y_extra = y_ins = y_med = y_tax = 0.0
         if m + 1 == retire_m:
-            retire_nw = sum(bal) + free + bucket + lp - loan_bal + s.employer_lump  # 含退休當月入帳的雇主退休金
+            retire_nw = (sum(bal) + free + bucket + lp - loan_bal + prop_value(m + 1)
+                         + s.employer_lump)  # 含退休當月入帳的雇主退休金
             retire_real = retire_nw / (infl_m ** (m + 1))
 
     if retire_m == 0:
-        retire_nw = sum(a.cash for a in s.accounts) + s.savings_cash + s.lp_balance + s.employer_lump
-        retire_real = retire_nw
+        retire_nw = (sum(a.cash for a in s.accounts) + s.savings_cash + s.lp_balance + s.employer_lump
+                     + sum(p_.value for p_ in s.properties))
         retire_real = retire_nw
     if s.lp_enabled and s.lp_claim_age < s.retire_age:
         warnings.append("勞退請領年齡早於退休年齡，已視為退休時才請領")
@@ -474,3 +624,9 @@ def simulate(s: Settings, today: Optional[dt.date] = None) -> Result:
                   depleted_age=depleted, li_monthly=li_pay, lp_monthly=lp_pay,
                   lp_at_claim=lp_at_claim, monthly_surplus_now=surplus_now or 0.0,
                   warnings=warnings)
+
+
+def simulate_scenarios(s: Settings, today: Optional[dt.date] = None) -> dict:
+    """悲觀 / 基準 / 樂觀：投資帳戶（含退休金帳戶）報酬率 ∓ scenario_delta 個百分點。"""
+    d = s.scenario_delta
+    return {"悲觀": simulate(s, today, -d), "基準": simulate(s, today, 0.0), "樂觀": simulate(s, today, d)}

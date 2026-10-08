@@ -10,7 +10,8 @@ import sys
 import tkinter as tk
 from tkinter import filedialog, font as tkfont, messagebox, ttk
 
-from .engine import Account, Loan, Result, Settings, Stage, from_dict, simulate, to_dict
+from .engine import (Account, ExtraIncome, Insurance, Loan, Property, Result, Settings, Stage, from_dict,
+                     simulate_scenarios, to_dict)
 
 # ---------- 配色 ----------
 C = {
@@ -334,15 +335,18 @@ class App(tk.Tk):
     F = {
         "current_age": ("目前年齡", "歲"), "retire_age": ("預期退休年齡", "歲"),
         "life_expectancy": ("預期壽命（試算到幾歲）", "歲"),
-        "monthly_income": ("月均收入（稅前）", "NT$/月"), "income_growth": ("每年調薪", "%"),
-        "income_tax_rate": ("所得稅有效稅率", "%"),
+        "salary_net": ("實領月薪", "NT$/月"), "salary_withheld": ("每月預扣所得稅（稅款準備金）", "NT$/月"),
+        "income_growth": ("每年調薪", "%"), "income_tax_rate": ("年度結算有效稅率", "%"),
+        "medical_start_age": ("醫療費用起算年齡", "歲"), "medical_monthly": ("起算時每月醫療費用（今日幣值）", "NT$/月"),
+        "medical_growth": ("醫療費用高於通膨的年增幅", "%/年"),
+        "scenario_delta": ("悲觀 / 樂觀：投資報酬率 ∓", "百分點"),
         "monthly_expense": ("目前每月生活支出（今日幣值）", "NT$/月"),
         "retire_expense": ("退休後每月生活支出（今日幣值）", "NT$/月"),
         "inflation": ("通膨率", "%/年"),
         "bucket_amount": ("每年年初補足金額（今日幣值）", "NT$"),
         "savings_cash": ("活存現金（未投入）", "NT$"), "savings_rate": ("活存年利率", "%"),
         "gains_tax_rate": ("投資獲利稅率", "%"),
-        "lp_wage": ("提繳工資（0 = 取月收入）", "NT$/月"), "lp_wage_cap": ("提繳工資上限", "NT$/月"),
+        "lp_wage": ("提繳工資（0 = 以實領+預扣稅估算）", "NT$/月"), "lp_wage_cap": ("提繳工資上限", "NT$/月"),
         "lp_employer_pct": ("雇主/學校提繳", "%"), "lp_self_pct": ("個人提繳（自提）", "%"),
         "lp_balance": ("專戶現有餘額", "NT$"), "lp_return": ("專戶年收益率（累積/月領期）", "%"),
         "lp_claim_age": ("請領年齡（不早於退休；私校可退休即領）", "歲"),
@@ -356,11 +360,12 @@ class App(tk.Tk):
         enable_dpi_awareness()
         super().__init__()
         self.title("退休收益預測")
-        self.geometry("1200x860")
-        self.minsize(1040, 700)
+        self.geometry("1200x900")
+        self.minsize(1040, 740)
         self.fonts = setup_style(self)
         self.s = Settings()
         self.result: Result | None = None
+        self.results: dict = {}
         self.vars: dict[str, tk.Variable] = {}
         self.show_real = tk.BooleanVar(value=False)
         self.status = tk.StringVar(value="填好資料後按「開始試算」")
@@ -383,12 +388,13 @@ class App(tk.Tk):
         ttk.Button(bar, text="載入設定", command=self.load_from).pack(side="left", padx=6)
         ttk.Button(bar, text="匯出 CSV", command=self.export_csv).pack(side="left", padx=6)
         ttk.Checkbutton(bar, text="以今日購買力（扣除通膨）顯示", style="Check.TCheckbutton",
-                        variable=self.show_real, command=self._render).pack(side="right")
+                        variable=self.show_real, command=self._on_basis).pack(side="right")
 
         self.nb = ttk.Notebook(self)
         self.nb.pack(fill="both", expand=True, padx=18, pady=(4, 0))
         tabs = {}
         for key, name in (("basic", "  基本資料  "), ("acc", "  投資帳戶  "), ("loan", "  房貸 / 貸款  "),
+                          ("prop", "  不動產  "), ("ins", "  保險  "), ("extra", "  額外收入  "),
                           ("pen", "  退休金 / 勞保  "), ("res", "  試算結果  ")):
             f = tk.Frame(self.nb, bg=C["bg"])
             self.nb.add(f, text=name)
@@ -410,6 +416,27 @@ class App(tk.Tk):
             note="固定月扣款：直接輸入每月金額；本息平均攤還：輸入本金與利率，自動算出每月扣款與餘額。",
             widths=(180, 220, 180, 150, 150))
         self.loan_tree.column("pay", anchor="e")
+        self.prop_tree = self._list_tab(
+            tabs["prop"], ("name", "value", "g", "sell", "loan"),
+            ("名稱", "目前市值 NT$", "年增值率 %", "出售年齡", "出售時還清貸款"),
+            self.add_prop, self.edit_prop, self.del_prop,
+            note="不動產市值計入淨資產；設定出售年齡後，扣除交易成本與綁定貸款的餘額，其餘入帳。不含房地合一稅，可調高交易成本估算。",
+            widths=(200, 170, 130, 130, 200))
+        self.prop_tree.column("value", anchor="e")
+        self.ins_tree = self._list_tab(
+            tabs["ins"], ("name", "premium", "ages", "payout", "to"),
+            ("名稱", "保費 NT$", "繳費年齡", "滿期金 NT$（領取年齡）", "入帳帳戶"),
+            self.add_ins, self.edit_ins, self.del_ins,
+            note="保費列入每月支出；年繳於保單年度起始月扣款。滿期金在領取年齡入帳到指定帳戶。",
+            widths=(200, 180, 150, 220, 160))
+        self.ins_tree.column("premium", anchor="e")
+        self.extra_tree = self._list_tab(
+            tabs["extra"], ("name", "amount", "ages", "g", "tax"),
+            ("名稱", "金額 NT$", "期間（年齡）", "每年成長 %", "是否課稅"),
+            self.add_extra, self.edit_extra, self.del_extra,
+            note="薪水以外的收入：兼職、租金、股利、顧問費等；年金額平均分攤到每月，可設定期間與成長率。",
+            widths=(200, 200, 170, 130, 110))
+        self.extra_tree.column("amount", anchor="e")
         self._build_results(self.tab_res)
         tk.Label(self, textvariable=self.status, bg=C["navy"], fg="#C7D4E8", anchor="w", padx=18, pady=5,
                  font=self.fonts["small"]).pack(fill="x", side="bottom", pady=(8, 0))
@@ -442,25 +469,33 @@ class App(tk.Tk):
 
     def _build_basic(self, p):
         p.configure(padx=2, pady=12)
-        c1 = Card(p, "個人與收入", self.fonts)
-        for k in ("current_age", "retire_age", "life_expectancy", "monthly_income", "income_growth",
-                  "income_tax_rate"):
-            self._money_entry(c1, k)
-        c1.pad()
-        c2 = Card(p, "支出與通膨", self.fonts)
-        for k in ("monthly_expense", "retire_expense", "inflation"):
-            self._money_entry(c2, k)
-        c2.pad()
-        c3 = Card(p, "現金與投資稅", self.fonts)
-        for k in ("savings_cash", "savings_rate", "gains_tax_rate"):
-            self._money_entry(c3, k)
-        c3.pad()
-        c4 = Card(p, "退休後生活費帳戶", self.fonts,
-                  hint="退休後每年年初，依投資帳戶清單順序提領，把此帳戶補足到設定金額；"
-                       "年金與退休金月領先進此帳戶，生活費與貸款由此支出。")
-        self._money_entry(c4, "bucket_amount")
-        c4.pad()
-        self._grid_cards(p, [c1, c2, c3, c4])
+        left = tk.Frame(p, bg=C["bg"])
+        right = tk.Frame(p, bg=C["bg"])
+        for c, f in enumerate((left, right)):
+            p.columnconfigure(c, weight=1, uniform="col")
+            f.grid(row=0, column=c, sticky="new", padx=(0, 8) if c == 0 else (8, 0))
+            f.columnconfigure(0, weight=1)
+
+        def card(parent, title, keys, hint=None):
+            cd = Card(parent, title, self.fonts, hint=hint)
+            for k in keys:
+                self._money_entry(cd, k)
+            cd.pad()
+            cd.grid(sticky="ew", pady=(0, 10), row=parent.grid_size()[1], column=0)
+            return cd
+        card(left, "個人資料", ("current_age", "retire_age", "life_expectancy"))
+        card(left, "薪水與稅款準備金", ("salary_net", "salary_withheld", "income_growth", "income_tax_rate"),
+             hint="以「實領月薪」輸入；每月預扣的所得稅視為稅款準備金，每年 5 月依「年度結算有效稅率」"
+                  "（課稅所得 = 薪資 + 應稅額外收入）結算上一年度，多退少補。")
+        card(left, "現金與投資稅", ("savings_cash", "savings_rate", "gains_tax_rate"))
+        card(right, "支出與通膨", ("monthly_expense", "retire_expense", "inflation"))
+        card(right, "醫療費用", ("medical_start_age", "medical_monthly", "medical_growth"),
+             hint="從起算年齡起每月加計醫療費用，並以高於一般通膨的幅度逐年成長。填 0 表示不計。")
+        card(right, "退休後生活費帳戶", ("bucket_amount",),
+             hint="退休後每年年初，依投資帳戶清單順序提領，把此帳戶補足到設定金額；"
+                  "年金與退休金月領先進此帳戶，生活費與貸款由此支出。")
+        card(right, "情境設定", ("scenario_delta",),
+             hint="試算時同時跑三種情境：悲觀 = 投資帳戶報酬率下調、樂觀 = 上調相同百分點，基準 = 原設定。")
 
     def _build_pension(self, p):
         p.configure(padx=2, pady=12)
@@ -541,16 +576,43 @@ class App(tk.Tk):
         self.alert = tk.Label(p, text="", bg=C["bg"], fg=C["warn"], anchor="w", justify="left",
                               font=self.fonts["small"], wraplength=1080)
         self.alert.pack(fill="x", pady=(6, 0))
-        chart_card = tk.Frame(p, bg=C["card"], highlightthickness=1, highlightbackground=C["line"])
-        chart_card.pack(fill="x", pady=(6, 8))
-        self.canvas = tk.Canvas(chart_card, height=250, bg=C["card"], highlightthickness=0)
-        self.canvas.pack(fill="x", padx=6, pady=6)
+        mid = tk.Frame(p, bg=C["bg"])
+        mid.pack(fill="x", pady=(6, 8))
+        chart_card = tk.Frame(mid, bg=C["card"], highlightthickness=1, highlightbackground=C["line"])
+        chart_card.pack(side="left", fill="both", expand=True)
+        self.canvas = tk.Canvas(chart_card, height=240, bg=C["card"], highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True, padx=6, pady=6)
         self.canvas.bind("<Configure>", lambda e: self._draw_chart())
         self.canvas.bind("<Motion>", self._hover)
         self.canvas.bind("<Leave>", lambda e: self.canvas.delete("hover"))
+        sc = tk.Frame(mid, bg=C["card"], highlightthickness=1, highlightbackground=C["line"], width=400)
+        sc.pack(side="left", fill="y", padx=(8, 0))
+        sc.pack_propagate(False)
+        tk.Label(sc, text="情境比較", bg=C["card"], fg=C["navy"], font=self.fonts["h2"]).pack(
+            anchor="w", padx=14, pady=(10, 4))
+        self.sc_tree = ttk.Treeview(sc, columns=("n", "r", "e", "d"), show="headings", height=3,
+                                    selectmode="none")
+        for c, h, w_ in (("n", "情境", 56), ("r", "退休時淨資產", 100), ("e", "壽命時淨資產", 100), ("d", "耗盡", 64)):
+            self.sc_tree.heading(c, text=h)
+            self.sc_tree.column(c, width=w_, anchor="e" if c in "re" else "center", stretch=False)
+        self.sc_tree.pack(fill="x", padx=12)
+        self.sc_note = tk.Label(sc, text="", bg=C["card"], fg=C["muted"], font=self.fonts["small"],
+                                justify="left", anchor="w", wraplength=370)
+        self.sc_note.pack(fill="x", padx=14, pady=(6, 4))
+        self.show_prop = tk.BooleanVar(value=True)
+        ttk.Checkbutton(sc, text="圖表含不動產市值", variable=self.show_prop,
+                        command=self._draw_chart).pack(anchor="w", padx=14, pady=(2, 0))
+        bar = tk.Frame(p, bg=C["bg"])
+        bar.pack(fill="x", pady=(0, 4))
+        ttk.Label(bar, text="逐年表情境：").pack(side="left")
+        self.table_scn = tk.StringVar(value="基準")
+        cb = ttk.Combobox(bar, textvariable=self.table_scn, values=["悲觀", "基準", "樂觀"], state="readonly",
+                          width=6)
+        cb.pack(side="left")
+        cb.bind("<<ComboboxSelected>>", lambda e: self._fill_table())
         tbl = tk.Frame(p, bg=C["card"], highlightthickness=1, highlightbackground=C["line"])
         tbl.pack(fill="both", expand=True)
-        self.res_tree = ttk.Treeview(tbl, show="headings", height=8)
+        self.res_tree = ttk.Treeview(tbl, show="headings", height=6)
         ys = ttk.Scrollbar(tbl, orient="vertical", command=self.res_tree.yview)
         xs = ttk.Scrollbar(tbl, orient="horizontal", command=self.res_tree.xview)
         self.res_tree.configure(yscrollcommand=ys.set, xscrollcommand=xs.set)
@@ -604,6 +666,24 @@ class App(tk.Tk):
             end = l.end or f"(+{l.years:g} 年)"
             self.loan_tree.insert("", "end", values=(l.name, mode, amt, l.start, end),
                                   tags=("odd" if i % 2 else "even",))
+
+        self.prop_tree.delete(*self.prop_tree.get_children())
+        for i, x in enumerate(self.s.properties):
+            sell = f"{x.sell_age:g} 歲" if x.sell_age > 0 else "不出售"
+            self.prop_tree.insert("", "end", tags=("odd" if i % 2 else "even",),
+                                  values=(x.name, money(x.value), f"{x.appreciation:g}", sell, x.loan_name or "—"))
+        self.ins_tree.delete(*self.ins_tree.get_children())
+        for i, x in enumerate(self.s.insurances):
+            pay = f"{money(x.premium)} / {'年' if x.freq == 'year' else '月'}"
+            out = f"{money(x.payout)}（{(x.payout_age or x.end_age):g} 歲）" if x.payout > 0 else "—"
+            self.ins_tree.insert("", "end", tags=("odd" if i % 2 else "even",),
+                                 values=(x.name, pay, f"{x.start_age:g}–{x.end_age:g} 歲", out, x.payout_to or "活存"))
+        self.extra_tree.delete(*self.extra_tree.get_children())
+        for i, x in enumerate(self.s.extra_incomes):
+            amt = f"{money(x.amount)} / {'年' if x.freq == 'year' else '月'}"
+            self.extra_tree.insert("", "end", tags=("odd" if i % 2 else "even",),
+                                   values=(x.name, amt, f"{x.start_age:g}–{x.end_age:g} 歲", f"{x.growth:g}",
+                                           "是" if x.taxable else "否"))
 
     # ---------- 投資帳戶 / 貸款編輯 ----------
     def _sel(self, tree):
@@ -690,18 +770,134 @@ class App(tk.Tk):
             del self.s.loans[i]
             self._refresh_lists()
 
+    NONE = "（無）"
+    CASH = "（活存）"
+
+    def add_prop(self):
+        self._crud(self.prop_tree, self.s.properties, self._prop_dialog, Property)[0]()
+
+    def edit_prop(self):
+        self._crud(self.prop_tree, self.s.properties, self._prop_dialog, Property)[1]()
+
+    def del_prop(self):
+        self._crud(self.prop_tree, self.s.properties, self._prop_dialog, Property)[2]()
+
+    def _new_ins(self):
+        return Insurance(start_age=self.s.current_age, end_age=self.s.current_age + 20)
+
+    def add_ins(self):
+        self._crud(self.ins_tree, self.s.insurances, self._ins_dialog, self._new_ins)[0]()
+
+    def edit_ins(self):
+        self._crud(self.ins_tree, self.s.insurances, self._ins_dialog, self._new_ins)[1]()
+
+    def del_ins(self):
+        self._crud(self.ins_tree, self.s.insurances, self._ins_dialog, self._new_ins)[2]()
+
+    def _new_extra(self):
+        return ExtraIncome(start_age=self.s.current_age, end_age=self.s.retire_age)
+
+    def add_extra(self):
+        self._crud(self.extra_tree, self.s.extra_incomes, self._extra_dialog, self._new_extra)[0]()
+
+    def edit_extra(self):
+        self._crud(self.extra_tree, self.s.extra_incomes, self._extra_dialog, self._new_extra)[1]()
+
+    def del_extra(self):
+        self._crud(self.extra_tree, self.s.extra_incomes, self._extra_dialog, self._new_extra)[2]()
+
+    def _acct_choices(self):
+        extra = ["退休金帳戶"] if (self.s.lp_enabled and self.s.lp_lump_sum) or self.s.employer_lump > 0 else []
+        return [self.CASH] + [a.name for a in self.s.accounts] + extra
+
+    def _crud(self, tree, items, dialog, new):
+        """回傳 (add, edit, delete)。"""
+        def add():
+            x = dialog(new())
+            if x:
+                items.append(x)
+                self._refresh_lists()
+
+        def edit():
+            i = self._sel(tree)
+            if i is not None:
+                x = dialog(items[i])
+                if x:
+                    items[i] = x
+                    self._refresh_lists()
+
+        def delete():
+            i = self._sel(tree)
+            if i is not None:
+                del items[i]
+                self._refresh_lists()
+        return add, edit, delete
+
+    def _extra_dialog(self, x: ExtraIncome):
+        d = FormDialog(self, "額外收入", [
+            ("name", "名稱", "text", x.name), ("amount", "金額 NT$", "num", x.amount),
+            ("freq", "金額單位", "choice", "每年" if x.freq == "year" else "每月", ["每月", "每年"]),
+            ("start_age", "起始年齡", "num", x.start_age), ("end_age", "結束年齡（不含）", "num", x.end_age),
+            ("growth", "每年成長 %", "num", x.growth),
+            ("taxable", "是否計入所得稅", "choice", "是" if x.taxable else "否", ["是", "否"])])
+        if not d.result:
+            return None
+        r = d.result
+        r["freq"] = "year" if r["freq"] == "每年" else "month"
+        r["taxable"] = r["taxable"] == "是"
+        return ExtraIncome(**r)
+
+    def _ins_dialog(self, x: Insurance):
+        choices = self._acct_choices()
+        d = FormDialog(self, "保險", [
+            ("name", "名稱", "text", x.name), ("premium", "保費 NT$", "num", x.premium),
+            ("freq", "繳費方式", "choice", "每年" if x.freq == "year" else "每月", ["每月", "每年"]),
+            ("start_age", "繳費起始年齡", "num", x.start_age), ("end_age", "繳費結束年齡（不含）", "num", x.end_age),
+            ("inflation_adjust", "保費隨通膨調整", "choice", "是" if x.inflation_adjust else "否", ["否", "是"]),
+            ("payout", "滿期金 / 理賠金 NT$（0 = 無）", "num", x.payout),
+            ("payout_age", "領取年齡（0 = 繳費結束時）", "num", x.payout_age),
+            ("payout_to", "入帳帳戶", "choice", x.payout_to if x.payout_to in choices else self.CASH, choices)])
+        if not d.result:
+            return None
+        r = d.result
+        r["freq"] = "year" if r["freq"] == "每年" else "month"
+        r["inflation_adjust"] = r["inflation_adjust"] == "是"
+        r["payout_to"] = "" if r["payout_to"] == self.CASH else r["payout_to"]
+        return Insurance(**r)
+
+    def _prop_dialog(self, x: Property):
+        accts = self._acct_choices()
+        loans = [self.NONE] + [l.name for l in self.s.loans]
+        d = FormDialog(self, "不動產", [
+            ("name", "名稱", "text", x.name), ("value", "目前市值 NT$", "num", x.value),
+            ("appreciation", "年增值率 %", "num", x.appreciation),
+            ("sell_age", "出售年齡（0 = 不出售）", "num", x.sell_age),
+            ("sell_cost", "交易成本 %（仲介、稅費）", "num", x.sell_cost),
+            ("loan_name", "出售時一併還清的貸款", "choice", x.loan_name if x.loan_name in loans else self.NONE, loans),
+            ("proceeds_to", "售屋款入帳帳戶", "choice", x.proceeds_to if x.proceeds_to in accts else self.CASH, accts)])
+        if not d.result:
+            return None
+        r = d.result
+        r["loan_name"] = "" if r["loan_name"] == self.NONE else r["loan_name"]
+        r["proceeds_to"] = "" if r["proceeds_to"] == self.CASH else r["proceeds_to"]
+        return Property(**r)
+
     # ---------- 計算與顯示 ----------
     def calculate(self):
         try:
             self._from_form()
-            self.result = simulate(self.s)
+            self.results = simulate_scenarios(self.s)
         except ValueError as e:
             messagebox.showerror("無法試算", str(e))
             return
+        self.result = self.results["基準"]
         self._save_auto()
         self.nb.select(self.tab_res)
         self._render()
         self.status.set(f"試算完成 · {dt.datetime.now():%H:%M:%S} · 設定已自動儲存")
+
+    def _on_basis(self):
+        self._draw_chart()
 
     def _set_kpi(self, i, title, value, sub, color=None):
         f, t, v, s = self.kpis[i]
@@ -715,15 +911,17 @@ class App(tk.Tk):
             return
         s = self.s
         end = r.rows[-1]
-        self._set_kpi(0, f"{s.retire_age:g} 歲退休時淨資產", f"NT$ {short_money(r.retire_net_worth)}",
-                      f"今日購買力 NT$ {short_money(r.retire_real_net_worth)}")
-        self._set_kpi(1, f"{s.life_expectancy:g} 歲時淨資產", f"NT$ {short_money(end.net_worth)}",
-                      f"今日購買力 NT$ {short_money(end.real_net_worth)}",
+        ret_row = next((x for x in r.rows if abs(x.age - s.retire_age) < 0.01), None)
+        prop_ret = f"　不動產 {short_money(ret_row.property_value)}" if ret_row and ret_row.property_value else ""
+        self._set_kpi(0, f"{s.retire_age:g} 歲退休時淨資產（基準）", f"NT$ {short_money(r.retire_net_worth)}",
+                      f"今日購買力 NT$ {short_money(r.retire_real_net_worth)}{prop_ret}")
+        self._set_kpi(1, f"{s.life_expectancy:g} 歲時淨資產（基準）", f"NT$ {short_money(end.net_worth)}",
+                      f"今日購買力 NT$ {short_money(end.real_net_worth)}\n不含不動產 NT$ {short_money(end.liquid_net_worth)}",
                       C["bad"] if end.net_worth < 0 else None)
         if r.depleted_age:
-            self._set_kpi(2, "資產狀態", f"約 {r.depleted_age:.1f} 歲耗盡", "之後生活費出現缺口，需調整計畫", C["bad"])
+            self._set_kpi(2, "資產狀態（基準）", f"約 {r.depleted_age:.1f} 歲耗盡", "之後生活費出現缺口，需調整計畫", C["bad"])
         else:
-            self._set_kpi(2, "資產狀態", f"可支撐至 {s.life_expectancy:g} 歲", "全程現金流與資產皆為正", C["ok"])
+            self._set_kpi(2, "資產狀態（基準）", f"可支撐至 {s.life_expectancy:g} 歲", "全程現金流與流動資產皆為正", C["ok"])
         monthly = r.li_monthly + (0 if s.lp_lump_sum else r.lp_monthly)
         parts = [f"勞保年金 {money(r.li_monthly)}"]
         if s.lp_enabled:
@@ -732,53 +930,80 @@ class App(tk.Tk):
         if s.employer_lump > 0:
             parts.append(f"雇主退休金 {money(s.employer_lump)}")
         self._set_kpi(3, "退休後固定月收入", f"NT$ {money(monthly)}", "\n".join(parts))
-        msgs = [f"目前每月現金流（收入 − 支出 − 貸款 − 投資）：NT$ {money(r.monthly_surplus_now)}"] + \
+        msgs = [f"目前每月現金流（實領薪水 + 額外收入 − 支出 − 貸款 − 保險 − 投資）：NT$ {money(r.monthly_surplus_now)}"] + \
                [f"⚠ {w}" for w in r.warnings]
         self.alert.config(text="    ".join(msgs), fg=C["bad"] if r.monthly_surplus_now < 0 else C["muted"])
 
+        self.sc_tree.delete(*self.sc_tree.get_children())
+        for name in ("悲觀", "基準", "樂觀"):
+            x = self.results[name]
+            self.sc_tree.insert("", "end", values=(
+                name, short_money(x.retire_net_worth), short_money(x.rows[-1].net_worth),
+                f"{x.depleted_age:.0f} 歲" if x.depleted_age else "無"))
+        d = s.scenario_delta
+        self.sc_note.config(text=f"悲觀 / 樂觀：投資帳戶（含退休金帳戶）報酬率 ∓ {d:g} 個百分點；淨資產含不動產。")
+        self._fill_table()
+        self._draw_chart()
+
+    def _fill_table(self):
+        res = getattr(self, "results", None)
+        if not res:
+            return
+        r = res[self.table_scn.get()]
+        s = self.s
         names = r.account_names
-        cols = ["age", "income", "pension", "expense", "loan", "invest"] + \
-               [f"a{i}" for i in range(len(names))] + ["free", "bucket", "lp", "debt", "nw", "real"]
-        heads = ["年齡", "稅後薪資", "年金/退休金月領", "生活支出", "貸款支出", "新增投資"] + names + \
-                ["活存/現金", "生活費帳戶", "退休金專戶", "貸款餘額", "淨資產", "淨資產(今日購買力)"]
+        cols = ["age", "income", "extra", "pension", "tax", "expense", "med", "ins", "loan", "invest"] + \
+               [f"a{i}" for i in range(len(names))] + ["free", "bucket", "lp", "prop", "debt", "liq", "nw", "real"]
+        heads = ["年齡", "實領薪水", "額外收入", "年金/退休金月領", "稅款結算", "生活支出", "醫療費用", "保險保費",
+                 "貸款支出", "新增投資"] + names + ["活存/現金", "生活費帳戶", "退休金專戶", "不動產", "貸款餘額",
+                                                  "淨資產(不含不動產)", "淨資產", "淨資產(今日購買力)"]
         self.res_tree.configure(columns=cols)
         for c, h in zip(cols, heads):
             self.res_tree.heading(c, text=h)
-            self.res_tree.column(c, width=118 if c not in ("age",) else 64, anchor="e", stretch=False)
+            self.res_tree.column(c, width=118 if c != "age" else 64, anchor="e", stretch=False)
         self.res_tree.column("age", anchor="center")
         self.res_tree.delete(*self.res_tree.get_children())
         for i, x in enumerate(r.rows):
             tags = ["odd" if i % 2 else "even"]
             if abs(x.age - s.retire_age) < 0.01:
                 tags.append("retire")
-            self.res_tree.insert("", "end", tags=tags, values=[f"{x.age:g}", money(x.income), money(x.pension_income),
-                                                               money(x.expense), money(x.loan_paid), money(x.invested)] +
-                                 [money(b) for b in x.account_balances] +
-                                 [money(x.free_cash), money(x.bucket), money(x.lp_balance), money(x.loan_balance),
-                                  money(x.net_worth), money(x.real_net_worth)])
-        self._draw_chart()
+            self.res_tree.insert("", "end", tags=tags, values=[
+                f"{x.age:g}", money(x.income), money(x.extra_income), money(x.pension_income), money(x.tax_settle),
+                money(x.expense), money(x.medical), money(x.insurance), money(x.loan_paid), money(x.invested)] +
+                [money(b) for b in x.account_balances] +
+                [money(x.free_cash), money(x.bucket), money(x.lp_balance), money(x.property_value),
+                 money(x.loan_balance), money(x.liquid_net_worth), money(x.net_worth), money(x.real_net_worth)])
 
     # ---------- 圖表 ----------
+    SCN_COLORS = {"悲觀": "#DC2626", "基準": "#2563EB", "樂觀": "#0F9D8A"}
+
+    def _series(self, res: Result):
+        """依「含不動產 / 今日購買力」選項取得 (年齡, 數值)。"""
+        infl = 1 + self.s.inflation / 100
+        out = []
+        for x in res.rows:
+            v = x.net_worth if self.show_prop.get() else x.liquid_net_worth
+            if self.show_real.get():
+                v = v / infl ** (x.age - self.s.current_age)
+            out.append(v)
+        return out
+
     def _draw_chart(self):
         c = self.canvas
         c.delete("all")
         self._chart = None
-        r = self.result
+        res = getattr(self, "results", None)
         w, h = c.winfo_width(), c.winfo_height()
-        if not r or not r.rows or w < 50:
+        if not res or w < 50:
             c.create_text(w / 2 if w > 50 else 200, h / 2, text="按「開始試算」後在此顯示淨資產走勢",
                           fill=C["muted"], font=self.fonts["base"])
             return
         L, R, T, B = 78, 24, 34, 34
-        rows = r.rows
+        rows = res["基準"].rows
         ages = [x.age for x in rows]
-        nom = [x.net_worth for x in rows]
-        real = [x.real_net_worth for x in rows]
-        real_first = self.show_real.get()
-        main, sub = (real, nom) if real_first else (nom, real)
-        main_name, sub_name = ("今日購買力", "名目金額") if real_first else ("名目金額", "今日購買力")
-        allv = nom + real + [0]
-        ticks = nice_ticks(min(allv), max(allv), 5)
+        series = {k: self._series(v) for k, v in res.items()}
+        allv = [v for vals in series.values() for v in vals] + [0]
+        ticks = nice_ticks(min(allv), max(allv), 4)
         lo, hi = ticks[0], ticks[-1]
         x0, x1 = ages[0], ages[-1]
 
@@ -797,33 +1022,29 @@ class App(tk.Tk):
             a += step
         c.create_text(w - R, h - 8, text="年齡（歲）", anchor="e", fill=C["muted"], font=self.fonts["small"])
         c.create_line(L, py(0), w - R, py(0), fill="#9AA5B8")
-        # 退休 / 耗盡標記
         ra = self.s.retire_age
         if x0 <= ra <= x1:
             c.create_line(px(ra), T - 6, px(ra), h - B, fill="#D97706", dash=(4, 3))
             c.create_text(px(ra) + 5, T - 8, text=f"退休 {ra:g}", anchor="w", fill="#D97706", font=self.fonts["small"])
-        if r.depleted_age and x0 <= r.depleted_age <= x1:
-            dx = px(r.depleted_age)
-            c.create_line(dx, T - 6, dx, h - B, fill=C["bad"], dash=(2, 3))
-            c.create_text(dx - 5, T - 8, text=f"耗盡 {r.depleted_age:.0f}", anchor="e", fill=C["bad"],
-                          font=self.fonts["small"])
-        # 區域填色在最底層，其上依序為次要線（虛線）與主要線（粗線）
-        sp = [co for a_, v in zip(ages, sub) for co in (px(a_), py(v))]
-        mp = [co for a_, v in zip(ages, main) for co in (px(a_), py(v))]
-        if len(mp) >= 4:
-            c.create_polygon(*([px(ages[0]), py(0)] + mp + [px(ages[-1]), py(0)]), fill="#DCE8FF", outline="")
-        if len(sp) >= 4:
-            c.create_line(*sp, fill=C["c2"], width=2, dash=(5, 3))
-        if len(mp) >= 4:
-            c.create_line(*mp, fill=C["c1"], width=3)
-        # 圖例
+        base_pts = [co for a_, v in zip(ages, series["基準"]) for co in (px(a_), py(v))]
+        if len(base_pts) >= 4:
+            c.create_polygon(*([px(ages[0]), py(0)] + base_pts + [px(ages[-1]), py(0)]), fill="#E3ECFF", outline="")
+        for name in ("悲觀", "樂觀", "基準"):
+            pts = [co for a_, v in zip(ages, series[name]) for co in (px(a_), py(v))]
+            if len(pts) >= 4:
+                c.create_line(*pts, fill=self.SCN_COLORS[name], width=3 if name == "基準" else 2,
+                              dash=None if name == "基準" else (5, 3))
         lx = L
-        for name, color, dash in ((main_name, C["c1"], None), (sub_name, C["c2"], (5, 3))):
-            c.create_line(lx, 12, lx + 22, 12, fill=color, width=3 if dash is None else 2, dash=dash)
+        for name in ("悲觀", "基準", "樂觀"):
+            col = self.SCN_COLORS[name]
+            c.create_line(lx, 12, lx + 22, 12, fill=col, width=3 if name == "基準" else 2,
+                          dash=None if name == "基準" else (5, 3))
             c.create_text(lx + 28, 12, text=name, anchor="w", fill=C["text"], font=self.fonts["small"])
-            lx += 130
-        self._chart = {"px": px, "py": py, "ages": ages, "rows": rows, "L": L, "R": R, "T": T, "B": B,
-                       "w": w, "h": h}
+            lx += 78
+        basis = ("今日購買力" if self.show_real.get() else "名目金額") + ("・含不動產" if self.show_prop.get() else "・不含不動產")
+        c.create_text(lx + 10, 12, text=basis, anchor="w", fill=C["muted"], font=self.fonts["small"])
+        self._chart = {"px": px, "py": py, "ages": ages, "rows": rows, "series": series, "L": L, "R": R,
+                       "T": T, "B": B, "w": w, "h": h}
 
     def _hover(self, e):
         c = self.canvas
@@ -835,12 +1056,13 @@ class App(tk.Tk):
         row = g["rows"][i]
         x = g["px"](row.age)
         c.create_line(x, g["T"], x, g["h"] - g["B"], fill="#94A3B8", tags="hover")
-        for v, color in ((row.net_worth, C["c1"]), (row.real_net_worth, C["c2"])):
-            y = g["py"](v)
-            c.create_oval(x - 4, y - 4, x + 4, y + 4, fill="#FFFFFF", outline=color, width=2, tags="hover")
-        lines = [f"{row.age:g} 歲", f"名目淨資產  {money(row.net_worth)}",
-                 f"今日購買力  {money(row.real_net_worth)}", f"貸款餘額  {money(row.loan_balance)}"]
-        bw, bh = 188, 18 * len(lines) + 12
+        for name in ("悲觀", "基準", "樂觀"):
+            y = g["py"](g["series"][name][i])
+            c.create_oval(x - 4, y - 4, x + 4, y + 4, fill="#FFFFFF", outline=self.SCN_COLORS[name], width=2,
+                          tags="hover")
+        lines = [f"{row.age:g} 歲"] + [f"{n}  {money(g['series'][n][i])}" for n in ("樂觀", "基準", "悲觀")] + \
+                [f"（基準）不動產  {money(row.property_value)}", f"（基準）貸款餘額  {money(row.loan_balance)}"]
+        bw, bh = 214, 18 * len(lines) + 12
         bx = x + 14 if x + 14 + bw < g["w"] - 4 else x - 14 - bw
         by = max(g["T"], min(e.y - bh / 2, g["h"] - g["B"] - bh))
         c.create_rectangle(bx, by, bx + bw, by + bh, fill="#17304F", outline="", tags="hover")
@@ -889,25 +1111,29 @@ class App(tk.Tk):
             self.status.set(f"已載入設定：{p}")
 
     def export_csv(self):
-        if not self.result:
+        if not self.results:
             messagebox.showinfo("提示", "請先按「開始試算」")
             return
         p = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV", "*.csv")])
         if not p:
             return
-        r = self.result
+        scn = self.table_scn.get()
+        r = self.results[scn]
         with open(p, "w", newline="", encoding="utf-8-sig") as f:
             w = csv.writer(f)
-            w.writerow(["年齡", "稅後薪資", "年金/退休金月領", "生活支出", "貸款支出", "新增投資"] +
-                       r.account_names + ["活存/現金", "生活費帳戶", "退休金專戶", "貸款餘額", "淨資產",
-                                          "淨資產(今日購買力)"])
+            w.writerow(["年齡", "實領薪水", "額外收入", "年金/退休金月領", "稅款結算", "生活支出", "醫療費用", "保險保費",
+                        "貸款支出", "新增投資"] + r.account_names +
+                       ["活存/現金", "生活費帳戶", "退休金專戶", "不動產", "貸款餘額", "淨資產(不含不動產)", "淨資產",
+                        "淨資產(今日購買力)"])
             for x in r.rows:
-                w.writerow([x.age, round(x.income), round(x.pension_income), round(x.expense),
+                w.writerow([x.age, round(x.income), round(x.extra_income), round(x.pension_income),
+                            round(x.tax_settle), round(x.expense), round(x.medical), round(x.insurance),
                             round(x.loan_paid), round(x.invested)] +
                            [round(b) for b in x.account_balances] +
-                           [round(x.free_cash), round(x.bucket), round(x.lp_balance), round(x.loan_balance),
-                            round(x.net_worth), round(x.real_net_worth)])
-        self.status.set(f"已匯出 CSV：{p}")
+                           [round(x.free_cash), round(x.bucket), round(x.lp_balance), round(x.property_value),
+                            round(x.loan_balance), round(x.liquid_net_worth), round(x.net_worth),
+                            round(x.real_net_worth)])
+        self.status.set(f"已匯出 CSV（{scn}情境）：{p}")
 
 
 def main():
