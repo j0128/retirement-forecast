@@ -8,10 +8,13 @@ import math
 import os
 import sys
 import tkinter as tk
+import webbrowser
 from tkinter import filedialog, font as tkfont, messagebox, ttk
 
-from .engine import (Account, ExtraIncome, Insurance, Loan, Property, Result, Settings, Stage, from_dict,
-                     simulate_scenarios, to_dict)
+from .engine import (Account, ExtraExpense, ExtraIncome, Insurance, Loan, OneOff, Property, Result, Settings,
+                     Stage, from_dict, simulate_scenarios, to_dict)
+from .fmt import money, nice_ticks, short_money
+from .report import build_report
 
 # ---------- 配色 ----------
 C = {
@@ -29,33 +32,6 @@ def settings_path() -> str:
     base = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) \
         else os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base, "retirement_settings.json")
-
-
-def money(v: float) -> str:
-    return f"{v:,.0f}"
-
-
-def short_money(v: float) -> str:
-    a = abs(v)
-    if a >= 1e8:
-        return f"{v / 1e8:,.2f}億"
-    if a >= 1e4:
-        return f"{v / 1e4:,.0f}萬"
-    return f"{v:,.0f}"
-
-
-def nice_ticks(lo: float, hi: float, n: int = 5) -> list:
-    if hi <= lo:
-        hi = lo + 1
-    raw = (hi - lo) / n
-    mag = 10 ** math.floor(math.log10(raw))
-    step = min((m * mag for m in (1, 2, 2.5, 5, 10) if m * mag >= raw), default=raw)
-    start = math.floor(lo / step) * step
-    out, v = [], start
-    while v <= hi + step * 0.5:
-        out.append(v)
-        v += step
-    return out
 
 
 def stage_summary(stages) -> str:
@@ -124,10 +100,12 @@ def setup_style(root: tk.Tk) -> dict:
     st.configure("Treeview.Heading", background=C["navy"], foreground="#FFFFFF", relief="flat",
                  padding=(6, 7), font=fonts["bold"])
     st.map("Treeview.Heading", background=[("active", C["navy2"])])
-    st.configure("Vertical.TScrollbar", background="#C9D1DE", troughcolor=C["bg"], bordercolor=C["bg"],
-                 arrowcolor=C["navy"])
-    st.configure("Horizontal.TScrollbar", background="#C9D1DE", troughcolor=C["bg"], bordercolor=C["bg"],
-                 arrowcolor=C["navy"])
+    st.configure("Vertical.TScrollbar", background="#B9C3D3", troughcolor="#E3E8F0", bordercolor="#E3E8F0",
+                 arrowcolor=C["navy"], width=16, arrowsize=16)
+    st.map("Vertical.TScrollbar", background=[("active", "#8EA0BB")])
+    st.configure("Horizontal.TScrollbar", background="#B9C3D3", troughcolor="#E3E8F0", bordercolor="#E3E8F0",
+                 arrowcolor=C["navy"], width=16, arrowsize=16)
+    st.map("Horizontal.TScrollbar", background=[("active", "#8EA0BB")])
     return fonts
 
 
@@ -175,6 +153,29 @@ class Card(tk.Frame):
 
     def pad(self):
         tk.Frame(self, bg=C["card"], height=8).grid(row=self.row, column=0)
+
+
+class ScrollFrame(tk.Frame):
+    """可垂直捲動的頁面容器：內容放在 .inner。"""
+
+    def __init__(self, parent):
+        super().__init__(parent, bg=C["bg"])
+        self.canvas = tk.Canvas(self, bg=C["bg"], highlightthickness=0)
+        self.vbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=self.vbar.set)
+        self.vbar.pack(side="right", fill="y")
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.inner = tk.Frame(self.canvas, bg=C["bg"], padx=18, pady=14)
+        self.win = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
+        self.inner.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+        self.canvas.bind("<Configure>", lambda e: self.canvas.itemconfigure(self.win, width=e.width))
+
+    def scroll(self, units: int):
+        if self.inner.winfo_reqheight() > self.canvas.winfo_height():
+            self.canvas.yview_scroll(units, "units")
+
+    def to_top(self):
+        self.canvas.yview_moveto(0)
 
 
 class FormDialog(tk.Toplevel):
@@ -337,6 +338,7 @@ class App(tk.Tk):
         "life_expectancy": ("預期壽命（試算到幾歲）", "歲"),
         "salary_net": ("實領月薪", "NT$/月"), "salary_withheld": ("每月預扣所得稅（稅款準備金）", "NT$/月"),
         "income_growth": ("每年調薪", "%"), "income_tax_rate": ("年度結算有效稅率", "%"),
+        "bonus_months": ("年終 / 績效獎金（實領月薪的幾個月）", "個月"), "bonus_month": ("獎金發放月份", "月"),
         "medical_start_age": ("醫療費用起算年齡", "歲"), "medical_monthly": ("起算時每月醫療費用（今日幣值）", "NT$/月"),
         "medical_growth": ("醫療費用高於通膨的年增幅", "%/年"),
         "scenario_delta": ("悲觀 / 樂觀：投資報酬率 ∓", "百分點"),
@@ -356,12 +358,18 @@ class App(tk.Tk):
         "li_manual_monthly": ("直接輸入預估月領（>0 則採用）", "NT$/月"),
     }
 
+    NAV = [("basic", "基本資料"), ("income", "收入"), ("expense", "支出"), ("acc", "投資帳戶"),
+           ("loan", "房貸 / 貸款"), ("prop", "不動產"), ("ins", "保險"), ("pen", "退休金 / 勞保"),
+           ("res", "試算結果")]
+
     def __init__(self):
         enable_dpi_awareness()
         super().__init__()
         self.title("退休收益預測")
-        self.geometry("1200x900")
-        self.minsize(1040, 740)
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        w, h = min(1440, int(sw * 0.92)), min(960, int(sh * 0.9))
+        self.geometry(f"{w}x{h}+{(sw - w) // 2}+{max((sh - h) // 2 - 20, 0)}")
+        self.minsize(min(980, w), min(620, h))
         self.fonts = setup_style(self)
         self.s = Settings()
         self.result: Result | None = None
@@ -370,8 +378,31 @@ class App(tk.Tk):
         self.show_real = tk.BooleanVar(value=False)
         self.status = tk.StringVar(value="填好資料後按「開始試算」")
         self._chart = None
+        self.pages: dict[str, ScrollFrame] = {}
+        self.nav_items: dict = {}
+        self.current_page = None
         self._build()
+        self.bind_all("<MouseWheel>", self._wheel)
+        self.bind_all("<Button-4>", self._wheel)
+        self.bind_all("<Button-5>", self._wheel)
         self._load_auto()
+        self.show("basic")
+
+    def _wheel(self, e):
+        w = e.widget
+        if not isinstance(w, tk.Misc) or isinstance(w, (ttk.Treeview, tk.Listbox)):
+            return
+        num = getattr(e, "num", 0)
+        if num == 4:
+            units = -3
+        elif num == 5:
+            units = 3
+        else:
+            units = -3 if e.delta > 0 else 3
+        while w is not None and not isinstance(w, ScrollFrame):
+            w = getattr(w, "master", None)
+        if w is not None:
+            w.scroll(units)
 
     # ---------- 版面 ----------
     def _build(self):
@@ -381,65 +412,103 @@ class App(tk.Tk):
             side="left", padx=(22, 10), pady=12)
         tk.Label(head, text="資產 · 現金流 · 勞退勞保 · 退休生活費", bg=C["navy"], fg="#9FB3CF",
                  font=self.fonts["small"]).pack(side="left", pady=(8, 0))
-        bar = ttk.Frame(self)
-        bar.pack(fill="x", padx=18, pady=(12, 6))
+        tk.Label(self, textvariable=self.status, bg=C["navy"], fg="#C7D4E8", anchor="w", padx=18, pady=5,
+                 font=self.fonts["small"]).pack(fill="x", side="bottom")
+        body = tk.Frame(self, bg=C["bg"])
+        body.pack(fill="both", expand=True)
+        side = tk.Frame(body, bg=C["navy2"], width=190)
+        side.pack(side="left", fill="y")
+        side.pack_propagate(False)
+        tk.Label(side, text="設定項目", bg=C["navy2"], fg="#9FB3CF", font=self.fonts["small"], anchor="w").pack(
+            fill="x", padx=18, pady=(16, 6))
+        for i, (key, name) in enumerate(self.NAV):
+            if key == "res":
+                tk.Frame(side, bg="#35557F", height=1).pack(fill="x", padx=14, pady=8)
+            row = tk.Frame(side, bg=C["navy2"], cursor="hand2")
+            row.pack(fill="x")
+            bar = tk.Frame(row, bg=C["navy2"], width=4)
+            bar.pack(side="left", fill="y")
+            num = "▶" if key == "res" else f"{i + 1}"
+            lab = tk.Label(row, text=f"  {num}   {name}", bg=C["navy2"], fg="#DDE6F3", anchor="w",
+                           font=self.fonts["bold"] if key == "res" else self.fonts["base"], pady=9)
+            lab.pack(side="left", fill="x", expand=True)
+            self.nav_items[key] = (row, bar, lab)
+            for wdg in (row, lab, bar):
+                wdg.bind("<Button-1>", lambda e, k=key: self.show(k))
+                wdg.bind("<Enter>", lambda e, k=key: self._nav_hover(k, True))
+                wdg.bind("<Leave>", lambda e, k=key: self._nav_hover(k, False))
+        main = tk.Frame(body, bg=C["bg"])
+        main.pack(side="left", fill="both", expand=True)
+        bar = ttk.Frame(main)
+        bar.pack(fill="x", padx=18, pady=(12, 4))
         ttk.Button(bar, text="▶  開始試算", style="Primary.TButton", command=self.calculate).pack(side="left")
-        ttk.Button(bar, text="儲存設定", command=self.save_as).pack(side="left", padx=(14, 6))
-        ttk.Button(bar, text="載入設定", command=self.load_from).pack(side="left", padx=6)
-        ttk.Button(bar, text="匯出 CSV", command=self.export_csv).pack(side="left", padx=6)
+        for text, cmd in (("儲存設定", self.save_as), ("載入設定", self.load_from), ("匯出 CSV", self.export_csv),
+                          ("匯出報告", self.export_report)):
+            ttk.Button(bar, text=text, command=cmd).pack(side="left", padx=(10, 0))
         ttk.Checkbutton(bar, text="以今日購買力（扣除通膨）顯示", style="Check.TCheckbutton",
                         variable=self.show_real, command=self._on_basis).pack(side="right")
-
-        self.nb = ttk.Notebook(self)
-        self.nb.pack(fill="both", expand=True, padx=18, pady=(4, 0))
-        tabs = {}
-        for key, name in (("basic", "  基本資料  "), ("acc", "  投資帳戶  "), ("loan", "  房貸 / 貸款  "),
-                          ("prop", "  不動產  "), ("ins", "  保險  "), ("extra", "  額外收入  "),
-                          ("pen", "  退休金 / 勞保  "), ("res", "  試算結果  ")):
-            f = tk.Frame(self.nb, bg=C["bg"])
-            self.nb.add(f, text=name)
-            tabs[key] = f
-        self.tab_res = tabs["res"]
-        self._build_basic(tabs["basic"])
-        self._build_pension(tabs["pen"])
-        self.acc_tree = self._list_tab(
-            tabs["acc"], ("name", "cash", "stages"), ("帳戶名稱", "現金/本金 NT$", "投資時間段（年齡 / 報酬 / 加碼）"),
+        stack = tk.Frame(main, bg=C["bg"])
+        stack.pack(fill="both", expand=True)
+        stack.rowconfigure(0, weight=1)
+        stack.columnconfigure(0, weight=1)
+        for key, _ in self.NAV:
+            sf = ScrollFrame(stack)
+            sf.grid(row=0, column=0, sticky="nsew")
+            self.pages[key] = sf
+        self._build_basic(self.pages["basic"].inner)
+        self._build_income(self.pages["income"].inner)
+        self._build_expense(self.pages["expense"].inner)
+        self.acc_tree = self._list_card(
+            self.pages["acc"].inner, "投資帳戶", ("name", "cash", "stages"),
+            ("帳戶名稱", "現金/本金 NT$", "投資時間段（年齡 / 報酬 / 加碼）"),
             self.add_account, self.edit_account, self.del_account, reorder=self.move_account,
             note="每個帳戶可設多個投資時間段；退休後依清單順序由上而下提領（可用「上移 / 下移」調整）。",
-            widths=(180, 140, 640))
+            widths=(180, 140, 640), height=12)
         self.acc_tree.column("cash", anchor="e")
         self.acc_tree.column("stages", anchor="w")
-        self.loan_tree = self._list_tab(
-            tabs["loan"], ("name", "mode", "pay", "start", "end"),
+        self.loan_tree = self._list_card(
+            self.pages["loan"].inner, "房貸 / 貸款", ("name", "mode", "pay", "start", "end"),
             ("名稱", "方式", "每月扣款 / 本金 NT$", "起（YYYY-MM）", "迄（YYYY-MM）"),
             self.add_loan, self.edit_loan, self.del_loan,
             note="固定月扣款：直接輸入每月金額；本息平均攤還：輸入本金與利率，自動算出每月扣款與餘額。",
-            widths=(180, 220, 180, 150, 150))
+            widths=(180, 220, 180, 150, 150), height=12)
         self.loan_tree.column("pay", anchor="e")
-        self.prop_tree = self._list_tab(
-            tabs["prop"], ("name", "value", "g", "sell", "loan"),
+        self.prop_tree = self._list_card(
+            self.pages["prop"].inner, "不動產", ("name", "value", "g", "sell", "loan"),
             ("名稱", "目前市值 NT$", "年增值率 %", "出售年齡", "出售時還清貸款"),
             self.add_prop, self.edit_prop, self.del_prop,
             note="不動產市值計入淨資產；設定出售年齡後，扣除交易成本與綁定貸款的餘額，其餘入帳。不含房地合一稅，可調高交易成本估算。",
-            widths=(200, 170, 130, 130, 200))
+            widths=(200, 170, 130, 130, 200), height=12)
         self.prop_tree.column("value", anchor="e")
-        self.ins_tree = self._list_tab(
-            tabs["ins"], ("name", "premium", "ages", "payout", "to"),
+        self.ins_tree = self._list_card(
+            self.pages["ins"].inner, "保險", ("name", "premium", "ages", "payout", "to"),
             ("名稱", "保費 NT$", "繳費年齡", "滿期金 NT$（領取年齡）", "入帳帳戶"),
             self.add_ins, self.edit_ins, self.del_ins,
             note="保費列入每月支出；年繳於保單年度起始月扣款。滿期金在領取年齡入帳到指定帳戶。",
-            widths=(200, 180, 150, 220, 160))
+            widths=(200, 180, 150, 220, 160), height=12)
         self.ins_tree.column("premium", anchor="e")
-        self.extra_tree = self._list_tab(
-            tabs["extra"], ("name", "amount", "ages", "g", "tax"),
-            ("名稱", "金額 NT$", "期間（年齡）", "每年成長 %", "是否課稅"),
-            self.add_extra, self.edit_extra, self.del_extra,
-            note="薪水以外的收入：兼職、租金、股利、顧問費等；年金額平均分攤到每月，可設定期間與成長率。",
-            widths=(200, 200, 170, 130, 110))
-        self.extra_tree.column("amount", anchor="e")
-        self._build_results(self.tab_res)
-        tk.Label(self, textvariable=self.status, bg=C["navy"], fg="#C7D4E8", anchor="w", padx=18, pady=5,
-                 font=self.fonts["small"]).pack(fill="x", side="bottom", pady=(8, 0))
+        self._build_pension(self.pages["pen"].inner)
+        self._build_results(self.pages["res"].inner)
+
+    def _nav_hover(self, key, on):
+        if key == self.current_page:
+            return
+        row, bar, lab = self.nav_items[key]
+        bg = "#2D5282" if on else C["navy2"]
+        for wdg in (row, bar, lab):
+            wdg.configure(bg=bg)
+
+    def show(self, key):
+        self.current_page = key
+        for k, (row, bar, lab) in self.nav_items.items():
+            active = k == key
+            row.configure(bg="#10233D" if active else C["navy2"])
+            lab.configure(bg="#10233D" if active else C["navy2"], fg="#FFFFFF" if active else "#DDE6F3")
+            bar.configure(bg=C["accent"] if active else C["navy2"])
+        self.pages[key].tkraise()
+        self.pages[key].to_top()
+        if key == "res":
+            self.after(50, self._draw_chart)
 
     def _var(self, key, kind="str"):
         v = tk.BooleanVar() if kind == "bool" else tk.StringVar()
@@ -460,46 +529,92 @@ class App(tk.Tk):
             return
         self.vars[key].set(f"{v:,.0f}")
 
-    def _grid_cards(self, parent, cards, cols=2):
-        for c in range(cols):
-            parent.columnconfigure(c, weight=1, uniform="col")
-        for i, card in enumerate(cards):
-            card.grid(row=i // cols, column=i % cols, sticky="nsew", padx=(0 if i % cols == 0 else 8, 8 if i % cols == 0 else 0),
-                      pady=(0, 10))
-
-    def _build_basic(self, p):
-        p.configure(padx=2, pady=12)
-        left = tk.Frame(p, bg=C["bg"])
-        right = tk.Frame(p, bg=C["bg"])
+    def _two_cols(self, parent):
+        left = tk.Frame(parent, bg=C["bg"])
+        right = tk.Frame(parent, bg=C["bg"])
         for c, f in enumerate((left, right)):
-            p.columnconfigure(c, weight=1, uniform="col")
+            parent.columnconfigure(c, weight=1, uniform="col")
             f.grid(row=0, column=c, sticky="new", padx=(0, 8) if c == 0 else (8, 0))
             f.columnconfigure(0, weight=1)
+        return left, right
 
-        def card(parent, title, keys, hint=None):
-            cd = Card(parent, title, self.fonts, hint=hint)
-            for k in keys:
-                self._money_entry(cd, k)
-            cd.pad()
-            cd.grid(sticky="ew", pady=(0, 10), row=parent.grid_size()[1], column=0)
-            return cd
-        card(left, "個人資料", ("current_age", "retire_age", "life_expectancy"))
-        card(left, "薪水與稅款準備金", ("salary_net", "salary_withheld", "income_growth", "income_tax_rate"),
-             hint="以「實領月薪」輸入；每月預扣的所得稅視為稅款準備金，每年 5 月依「年度結算有效稅率」"
-                  "（課稅所得 = 薪資 + 應稅額外收入）結算上一年度，多退少補。")
-        card(left, "現金與投資稅", ("savings_cash", "savings_rate", "gains_tax_rate"))
-        card(right, "支出與通膨", ("monthly_expense", "retire_expense", "inflation"))
-        card(right, "醫療費用", ("medical_start_age", "medical_monthly", "medical_growth"),
-             hint="從起算年齡起每月加計醫療費用，並以高於一般通膨的幅度逐年成長。填 0 表示不計。")
-        card(right, "退休後生活費帳戶", ("bucket_amount",),
-             hint="退休後每年年初，依投資帳戶清單順序提領，把此帳戶補足到設定金額；"
-                  "年金與退休金月領先進此帳戶，生活費與貸款由此支出。")
-        card(right, "情境設定", ("scenario_delta",),
-             hint="試算時同時跑三種情境：悲觀 = 投資帳戶報酬率下調、樂觀 = 上調相同百分點，基準 = 原設定。")
+    def _card(self, parent, title, keys=(), hint=None):
+        cd = Card(parent, title, self.fonts, hint=hint)
+        for k in keys:
+            self._money_entry(cd, k)
+        cd.pad()
+        cd.grid(sticky="ew", pady=(0, 12), row=parent.grid_size()[1], column=0)
+        return cd
+
+    def _page_title(self, parent, title, sub):
+        tk.Label(parent, text=title, bg=C["bg"], fg=C["navy"], font=self.fonts["h1"], anchor="w").pack(fill="x")
+        tk.Label(parent, text=sub, bg=C["bg"], fg=C["muted"], font=self.fonts["small"], anchor="w").pack(
+            fill="x", pady=(0, 12))
+
+    def _build_basic(self, p):
+        self._page_title(p, "基本資料", "年齡、現金、退休後生活費帳戶、醫療費用與情境設定")
+        cols = tk.Frame(p, bg=C["bg"])
+        cols.pack(fill="x")
+        left, right = self._two_cols(cols)
+        self._card(left, "個人資料", ("current_age", "retire_age", "life_expectancy"))
+        self._card(left, "現金與投資稅", ("savings_cash", "savings_rate", "gains_tax_rate"))
+        self._card(right, "退休後生活費帳戶", ("bucket_amount",),
+                   hint="退休後每年年初，依投資帳戶清單順序提領，把此帳戶補足到設定金額；"
+                        "年金與退休金月領先進此帳戶，生活費與貸款由此支出。")
+        self._card(right, "醫療費用", ("medical_start_age", "medical_monthly", "medical_growth"),
+                   hint="從起算年齡起每月加計醫療費用，並以高於一般通膨的幅度逐年成長。填 0 表示不計。")
+        self._card(right, "情境設定", ("scenario_delta",),
+                   hint="試算時同時跑三種情境：悲觀 = 投資帳戶報酬率下調、樂觀 = 上調相同百分點，基準 = 原設定。")
+
+    def _build_income(self, p):
+        self._page_title(p, "收入", "固定薪資、年終獎金，以及兼職、租金、股利等額外收入")
+        cols = tk.Frame(p, bg=C["bg"])
+        cols.pack(fill="x")
+        left, right = self._two_cols(cols)
+        self._card(left, "固定薪資與稅款準備金",
+                   ("salary_net", "salary_withheld", "income_growth", "income_tax_rate", "bonus_months", "bonus_month"),
+                   hint="以「實領月薪」輸入；每月預扣的所得稅視為稅款準備金。")
+        self._card(right, "稅款準備金如何運作", (),
+                   hint="每年 5 月依「年度結算有效稅率」結算上一年度所得稅：課稅所得 = 薪資（實領 + 預扣）+ 年終獎金 + "
+                        "應稅的額外收入；已預扣的稅款抵繳，多退少補。\n\n"
+                        "年終獎金以實領月薪的月數計算，於指定月份發放並計入課稅所得。退休後不再有薪資。")
+        self.extra_tree = self._list_card(
+            p, "額外收入", ("name", "amount", "ages", "g", "tax"),
+            ("名稱", "金額 NT$", "期間（年齡）", "每年成長 %", "是否課稅"),
+            self.add_extra, self.edit_extra, self.del_extra,
+            note="薪水以外的收入：兼職、租金、股利、顧問費等；年金額平均分攤到每月，可設定期間與成長率，退休後仍可持續。",
+            widths=(200, 200, 170, 130, 110), height=6)
+        self.extra_tree.column("amount", anchor="e")
+
+    def _build_expense(self, p):
+        self._page_title(p, "支出", "生活支出、其他固定支出與一次性收支（貸款、保險、醫療費用請至各自頁面設定）")
+        cols = tk.Frame(p, bg=C["bg"])
+        cols.pack(fill="x")
+        left, right = self._two_cols(cols)
+        self._card(left, "生活支出與通膨", ("monthly_expense", "retire_expense", "inflation"))
+        self._card(right, "支出項目說明", (),
+                   hint="生活支出以今日幣值輸入，隨通膨逐年上調。\n貸款、保險、醫療費用另於各頁設定；"
+                        "子女教育、孝親費、旅遊等有期限的支出請加入「其他固定支出」；買車、出國、遺產等請加入「一次性收支」。")
+        self.xexp_tree = self._list_card(
+            p, "其他固定支出", ("name", "amount", "ages", "infl"),
+            ("名稱", "金額 NT$（今日幣值）", "期間（年齡）", "隨通膨調整"),
+            self.add_xexp, self.edit_xexp, self.del_xexp,
+            note="子女教育、孝親費、旅遊等：年金額平均分攤到每月，有起訖年齡。",
+            widths=(220, 230, 180, 130), height=5)
+        self.xexp_tree.column("amount", anchor="e")
+        self.oneoff_tree = self._list_card(
+            p, "一次性收支", ("name", "kind", "amount", "age", "acct"),
+            ("名稱", "類型", "金額 NT$（名目）", "發生年齡", "入帳帳戶"),
+            self.add_oneoff, self.edit_oneoff, self.del_oneoff,
+            note="買車、出國、子女教育金、遺產入帳等一次性款項；支出走一般現金流，收入入帳到指定帳戶。",
+            widths=(200, 100, 200, 130, 180), height=5)
+        self.oneoff_tree.column("amount", anchor="e")
 
     def _build_pension(self, p):
-        p.configure(padx=2, pady=12)
-        c1 = Card(p, "退休金專戶（勞退新制 / 私校退撫儲金）", self.fonts,
+        self._page_title(p, "退休金 / 勞保", "退休金專戶（勞退新制、私校退撫儲金）、雇主另給的退休金，以及勞保老年年金")
+        cols = tk.Frame(p, bg=C["bg"])
+        cols.pack(fill="x")
+        c1 = Card(cols, "退休金專戶（勞退新制 / 私校退撫儲金）", self.fonts,
                   hint="提繳比例請依薪資單設定。一次領會在請領時轉入「退休金帳戶」繼續投資。")
         self.vars["lp_enabled"] = tk.BooleanVar()
         c1.widget(ttk.Checkbutton(c1, text="計入退休金專戶", variable=self.vars["lp_enabled"]), pady=(2, 2))
@@ -511,11 +626,11 @@ class App(tk.Tk):
                                                          values=["月領", "一次領"], state="readonly", width=14))
         c1.widget(ttk.Button(c1, text="設定「退休金帳戶」投資階段", style="Small.TButton",
                              command=self.edit_lump_stages), pady=(4, 12))
-        c2 = Card(p, "雇主另給的退休金", self.fonts,
+        c2 = Card(cols, "雇主另給的退休金", self.fonts,
                   hint="退休當月一次領，轉入「退休金帳戶」，與專戶一次領的金額合併投資。填 0 表示沒有。")
         self._money_entry(c2, "employer_lump")
         c2.pad()
-        c3 = Card(p, "勞保老年年金", self.fonts,
+        c3 = Card(cols, "勞保老年年金", self.fonts,
                   hint="公式：年資 ×（投保薪資 × 0.775% + 3,000）與（投保薪資 × 1.55%）取高者；"
                        "提前/延後每年 ∓4%（最多 5 年）。年資 = 目前年資 + 退休前繼續投保年數。"
                        "投保薪資上限以現行規定為準。")
@@ -525,26 +640,29 @@ class App(tk.Tk):
         for k in ("li_avg_wage", "li_years_now", "li_claim_age", "li_manual_monthly"):
             self._money_entry(c3, k)
         c3.pad()
-        right = tk.Frame(p, bg=C["bg"])
-        right.columnconfigure(0, weight=1)
         for c in (0, 1):
-            p.columnconfigure(c, weight=1, uniform="col")
-        c1.grid(row=0, column=0, rowspan=2, sticky="nsew", padx=(0, 8), pady=(0, 10))
-        c2.grid(row=0, column=1, sticky="new", padx=(8, 0), pady=(0, 10))
-        c3.grid(row=1, column=1, sticky="new", padx=(8, 0), pady=(0, 10))
+            cols.columnconfigure(c, weight=1, uniform="col")
+        c1.grid(row=0, column=0, rowspan=2, sticky="nsew", padx=(0, 8), pady=(0, 12))
+        c2.grid(row=0, column=1, sticky="new", padx=(8, 0), pady=(0, 12))
+        c3.grid(row=1, column=1, sticky="new", padx=(8, 0), pady=(0, 12))
 
-    def _list_tab(self, parent, cols, heads, add, edit, delete, reorder=None, note="", widths=None):
-        parent.configure(padx=2, pady=12)
+    def _list_card(self, parent, title, cols, heads, add, edit, delete, reorder=None, note="", widths=None,
+                   height=8):
         card = tk.Frame(parent, bg=C["card"], highlightthickness=1, highlightbackground=C["line"])
-        card.pack(fill="both", expand=True, pady=(0, 10))
+        card.pack(fill="x", pady=(0, 12))
+        bar0 = tk.Frame(card, bg=C["card"])
+        bar0.pack(fill="x", padx=16, pady=(12, 2))
+        tk.Frame(bar0, bg=C["accent"], width=4, height=16).pack(side="left", padx=(0, 8))
+        tk.Label(bar0, text=title, bg=C["card"], fg=C["navy"], font=self.fonts["h2"]).pack(side="left")
         if note:
-            ttk.Label(card, text=note, style="Muted.TLabel").pack(anchor="w", padx=16, pady=(12, 4))
-        tree = ttk.Treeview(card, columns=cols, show="headings", height=9, selectmode="browse")
+            ttk.Label(card, text=note, style="Muted.TLabel", wraplength=900, justify="left").pack(
+                anchor="w", padx=16, pady=(0, 4))
+        tree = ttk.Treeview(card, columns=cols, show="headings", height=height, selectmode="browse")
         for i, (c, h) in enumerate(zip(cols, heads)):
             tree.heading(c, text=h)
             tree.column(c, width=(widths[i] if widths else 150), anchor="center")
         tree.tag_configure("odd", background=C["stripe"])
-        tree.pack(fill="both", expand=True, padx=16, pady=6)
+        tree.pack(fill="x", padx=16, pady=6)
         bar = ttk.Frame(card, style="Card.TFrame")
         bar.pack(fill="x", padx=16, pady=(2, 14))
         ttk.Button(bar, text="＋ 新增", style="Primary.TButton", command=add).pack(side="left")
@@ -557,7 +675,7 @@ class App(tk.Tk):
         return tree
 
     def _build_results(self, p):
-        p.configure(padx=2, pady=12)
+        self._page_title(p, "試算結果", "基準情境的關鍵指標、三情境比較與逐年明細")
         self.kpi_row = tk.Frame(p, bg=C["bg"])
         self.kpi_row.pack(fill="x")
         self.kpis = []
@@ -568,36 +686,59 @@ class App(tk.Tk):
             t = tk.Label(f, text="", bg=C["card"], fg=C["muted"], font=self.fonts["small"], anchor="w")
             v = tk.Label(f, text="—", bg=C["card"], fg=C["navy"], font=self.fonts["kpi"], anchor="w")
             s = tk.Label(f, text="", bg=C["card"], fg=C["muted"], font=self.fonts["small"], anchor="w",
-                         justify="left", wraplength=250)
+                         justify="left", wraplength=230)
             t.pack(fill="x", padx=14, pady=(10, 0))
             v.pack(fill="x", padx=14)
             s.pack(fill="x", padx=14, pady=(0, 10))
             self.kpis.append((f, t, v, s))
+        # 財務指標
+        hc = tk.Frame(p, bg=C["card"], highlightthickness=1, highlightbackground=C["line"])
+        hc.pack(fill="x", pady=(10, 0))
+        hb = tk.Frame(hc, bg=C["card"])
+        hb.pack(fill="x", padx=16, pady=(10, 0))
+        tk.Frame(hb, bg=C["accent"], width=4, height=16).pack(side="left", padx=(0, 8))
+        tk.Label(hb, text="財務指標", bg=C["card"], fg=C["navy"], font=self.fonts["h2"]).pack(side="left")
+        row = tk.Frame(hc, bg=C["card"])
+        row.pack(fill="x", padx=10, pady=(4, 10))
+        self.stats = []
+        for i in range(5):
+            row.columnconfigure(i, weight=1, uniform="st")
+            f = tk.Frame(row, bg=C["card"])
+            f.grid(row=0, column=i, sticky="nsew", padx=6)
+            t = tk.Label(f, text="", bg=C["card"], fg=C["muted"], font=self.fonts["small"], anchor="nw",
+                         wraplength=190, justify="left", height=2)
+            v = tk.Label(f, text="—", bg=C["card"], fg=C["navy"], font=self.fonts["h2"], anchor="w")
+            s = tk.Label(f, text="", bg=C["card"], fg=C["muted"], font=self.fonts["small"], anchor="w",
+                         wraplength=190, justify="left")
+            t.pack(fill="x")
+            v.pack(fill="x")
+            s.pack(fill="x")
+            self.stats.append((t, v, s))
         self.alert = tk.Label(p, text="", bg=C["bg"], fg=C["warn"], anchor="w", justify="left",
-                              font=self.fonts["small"], wraplength=1080)
+                              font=self.fonts["small"], wraplength=1000)
         self.alert.pack(fill="x", pady=(6, 0))
         mid = tk.Frame(p, bg=C["bg"])
         mid.pack(fill="x", pady=(6, 8))
+        sc = tk.Frame(mid, bg=C["card"], highlightthickness=1, highlightbackground=C["line"], width=360)
+        sc.pack(side="right", fill="y", padx=(8, 0))
+        sc.pack_propagate(False)
         chart_card = tk.Frame(mid, bg=C["card"], highlightthickness=1, highlightbackground=C["line"])
         chart_card.pack(side="left", fill="both", expand=True)
-        self.canvas = tk.Canvas(chart_card, height=240, bg=C["card"], highlightthickness=0)
+        self.canvas = tk.Canvas(chart_card, height=270, bg=C["card"], highlightthickness=0)
         self.canvas.pack(fill="both", expand=True, padx=6, pady=6)
         self.canvas.bind("<Configure>", lambda e: self._draw_chart())
         self.canvas.bind("<Motion>", self._hover)
         self.canvas.bind("<Leave>", lambda e: self.canvas.delete("hover"))
-        sc = tk.Frame(mid, bg=C["card"], highlightthickness=1, highlightbackground=C["line"], width=400)
-        sc.pack(side="left", fill="y", padx=(8, 0))
-        sc.pack_propagate(False)
         tk.Label(sc, text="情境比較", bg=C["card"], fg=C["navy"], font=self.fonts["h2"]).pack(
             anchor="w", padx=14, pady=(10, 4))
         self.sc_tree = ttk.Treeview(sc, columns=("n", "r", "e", "d"), show="headings", height=3,
                                     selectmode="none")
-        for c, h, w_ in (("n", "情境", 56), ("r", "退休時淨資產", 100), ("e", "壽命時淨資產", 100), ("d", "耗盡", 64)):
+        for c, h, w_ in (("n", "情境", 50), ("r", "退休時淨資產", 98), ("e", "壽命時淨資產", 98), ("d", "耗盡", 56)):
             self.sc_tree.heading(c, text=h)
             self.sc_tree.column(c, width=w_, anchor="e" if c in "re" else "center", stretch=False)
         self.sc_tree.pack(fill="x", padx=12)
         self.sc_note = tk.Label(sc, text="", bg=C["card"], fg=C["muted"], font=self.fonts["small"],
-                                justify="left", anchor="w", wraplength=370)
+                                justify="left", anchor="w", wraplength=330)
         self.sc_note.pack(fill="x", padx=14, pady=(6, 4))
         self.show_prop = tk.BooleanVar(value=True)
         ttk.Checkbutton(sc, text="圖表含不動產市值", variable=self.show_prop,
@@ -611,14 +752,14 @@ class App(tk.Tk):
         cb.pack(side="left")
         cb.bind("<<ComboboxSelected>>", lambda e: self._fill_table())
         tbl = tk.Frame(p, bg=C["card"], highlightthickness=1, highlightbackground=C["line"])
-        tbl.pack(fill="both", expand=True)
-        self.res_tree = ttk.Treeview(tbl, show="headings", height=6)
+        tbl.pack(fill="x")
+        self.res_tree = ttk.Treeview(tbl, show="headings", height=12)
         ys = ttk.Scrollbar(tbl, orient="vertical", command=self.res_tree.yview)
         xs = ttk.Scrollbar(tbl, orient="horizontal", command=self.res_tree.xview)
         self.res_tree.configure(yscrollcommand=ys.set, xscrollcommand=xs.set)
         ys.pack(side="right", fill="y")
         xs.pack(side="bottom", fill="x")
-        self.res_tree.pack(fill="both", expand=True)
+        self.res_tree.pack(fill="x")
         self.res_tree.tag_configure("odd", background=C["stripe"])
         self.res_tree.tag_configure("retire", background="#FFF4D6")
 
@@ -684,6 +825,18 @@ class App(tk.Tk):
             self.extra_tree.insert("", "end", tags=("odd" if i % 2 else "even",),
                                    values=(x.name, amt, f"{x.start_age:g}–{x.end_age:g} 歲", f"{x.growth:g}",
                                            "是" if x.taxable else "否"))
+
+        self.xexp_tree.delete(*self.xexp_tree.get_children())
+        for i, x in enumerate(self.s.extra_expenses):
+            amt = f"{money(x.amount)} / {'年' if x.freq == 'year' else '月'}"
+            self.xexp_tree.insert("", "end", tags=("odd" if i % 2 else "even",),
+                                  values=(x.name, amt, f"{x.start_age:g}–{x.end_age:g} 歲",
+                                          "是" if x.inflation_adjust else "否"))
+        self.oneoff_tree.delete(*self.oneoff_tree.get_children())
+        for i, x in enumerate(self.s.one_offs):
+            self.oneoff_tree.insert("", "end", tags=("odd" if i % 2 else "even",),
+                                    values=(x.name, "收入" if x.kind == "in" else "支出", money(x.amount),
+                                            f"{x.age:g} 歲", (x.account or "活存") if x.kind == "in" else "—"))
 
     # ---------- 投資帳戶 / 貸款編輯 ----------
     def _sel(self, tree):
@@ -794,6 +947,30 @@ class App(tk.Tk):
     def del_ins(self):
         self._crud(self.ins_tree, self.s.insurances, self._ins_dialog, self._new_ins)[2]()
 
+    def _new_xexp(self):
+        return ExtraExpense(start_age=self.s.current_age, end_age=self.s.current_age + 10)
+
+    def add_xexp(self):
+        self._crud(self.xexp_tree, self.s.extra_expenses, self._xexp_dialog, self._new_xexp)[0]()
+
+    def edit_xexp(self):
+        self._crud(self.xexp_tree, self.s.extra_expenses, self._xexp_dialog, self._new_xexp)[1]()
+
+    def del_xexp(self):
+        self._crud(self.xexp_tree, self.s.extra_expenses, self._xexp_dialog, self._new_xexp)[2]()
+
+    def _new_oneoff(self):
+        return OneOff(age=self.s.current_age + 5)
+
+    def add_oneoff(self):
+        self._crud(self.oneoff_tree, self.s.one_offs, self._oneoff_dialog, self._new_oneoff)[0]()
+
+    def edit_oneoff(self):
+        self._crud(self.oneoff_tree, self.s.one_offs, self._oneoff_dialog, self._new_oneoff)[1]()
+
+    def del_oneoff(self):
+        self._crud(self.oneoff_tree, self.s.one_offs, self._oneoff_dialog, self._new_oneoff)[2]()
+
     def _new_extra(self):
         return ExtraIncome(start_age=self.s.current_age, end_age=self.s.retire_age)
 
@@ -832,6 +1009,33 @@ class App(tk.Tk):
                 del items[i]
                 self._refresh_lists()
         return add, edit, delete
+
+    def _xexp_dialog(self, x: ExtraExpense):
+        d = FormDialog(self, "其他固定支出", [
+            ("name", "名稱", "text", x.name), ("amount", "金額 NT$（今日幣值）", "num", x.amount),
+            ("freq", "金額單位", "choice", "每年" if x.freq == "year" else "每月", ["每月", "每年"]),
+            ("start_age", "起始年齡", "num", x.start_age), ("end_age", "結束年齡（不含）", "num", x.end_age),
+            ("inflation_adjust", "隨通膨調整", "choice", "是" if x.inflation_adjust else "否", ["是", "否"])])
+        if not d.result:
+            return None
+        r = d.result
+        r["freq"] = "year" if r["freq"] == "每年" else "month"
+        r["inflation_adjust"] = r["inflation_adjust"] == "是"
+        return ExtraExpense(**r)
+
+    def _oneoff_dialog(self, x: OneOff):
+        choices = self._acct_choices()
+        d = FormDialog(self, "一次性收支", [
+            ("name", "名稱", "text", x.name),
+            ("kind", "類型", "choice", "收入" if x.kind == "in" else "支出", ["支出", "收入"]),
+            ("amount", "金額 NT$（名目）", "num", x.amount), ("age", "發生年齡", "num", x.age),
+            ("account", "收入入帳帳戶", "choice", x.account if x.account in choices else self.CASH, choices)])
+        if not d.result:
+            return None
+        r = d.result
+        r["kind"] = "in" if r["kind"] == "收入" else "out"
+        r["account"] = "" if r["account"] == self.CASH else r["account"]
+        return OneOff(**r)
 
     def _extra_dialog(self, x: ExtraIncome):
         d = FormDialog(self, "額外收入", [
@@ -892,7 +1096,7 @@ class App(tk.Tk):
             return
         self.result = self.results["基準"]
         self._save_auto()
-        self.nb.select(self.tab_res)
+        self.show("res")
         self._render()
         self.status.set(f"試算完成 · {dt.datetime.now():%H:%M:%S} · 設定已自動儲存")
 
@@ -930,9 +1134,31 @@ class App(tk.Tk):
         if s.employer_lump > 0:
             parts.append(f"雇主退休金 {money(s.employer_lump)}")
         self._set_kpi(3, "退休後固定月收入", f"NT$ {money(monthly)}", "\n".join(parts))
-        msgs = [f"目前每月現金流（實領薪水 + 額外收入 − 支出 − 貸款 − 保險 − 投資）：NT$ {money(r.monthly_surplus_now)}"] + \
-               [f"⚠ {w}" for w in r.warnings]
-        self.alert.config(text="    ".join(msgs), fg=C["bad"] if r.monthly_surplus_now < 0 else C["muted"])
+        infl = 1 + s.inflation / 100
+        yrs = max(s.retire_age - s.current_age, 0)
+        liq_ret = ret_row.liquid_net_worth if ret_row else r.retire_net_worth
+        real_liq = liq_ret / infl ** yrs
+        sust = real_liq * 0.04 / 12
+        need = s.retire_expense
+        need_nom = need * infl ** yrs
+        cov = monthly / need_nom if need_nom > 0 else 0
+        emerg = s.savings_cash / s.monthly_expense if s.monthly_expense > 0 else 0
+        tiles = [
+            ("退休時流動資產（今日購買力）", short_money(real_liq), "不含不動產，已扣貸款", None),
+            ("4% 法則可持續月提領（今日幣值）", money(sust), f"退休後每月支出需求 {money(need)}",
+             C["ok"] if sust >= need else C["warn"]),
+            ("固定月收入覆蓋率", f"{cov:.0%}", "勞保年金 + 退休金月領 ÷ 退休後支出",
+             C["ok"] if cov >= 0.6 else C["warn"]),
+            ("緊急預備金", f"{emerg:.1f} 個月", "活存現金 ÷ 目前每月生活支出",
+             C["ok"] if emerg >= 6 else C["warn"]),
+            ("目前每月現金流", money(r.monthly_surplus_now), "實領薪水 + 額外收入 − 各項支出 − 投資",
+             C["bad"] if r.monthly_surplus_now < 0 else C["ok"]),
+        ]
+        for (t_, v_, s_), (tt, vv, ss, col) in zip(self.stats, tiles):
+            t_.config(text=tt)
+            v_.config(text=vv, fg=col or C["navy"])
+            s_.config(text=ss)
+        self.alert.config(text="    ".join(f"⚠ {w}" for w in r.warnings))
 
         self.sc_tree.delete(*self.sc_tree.get_children())
         for name in ("悲觀", "基準", "樂觀"):
@@ -952,10 +1178,11 @@ class App(tk.Tk):
         r = res[self.table_scn.get()]
         s = self.s
         names = r.account_names
-        cols = ["age", "income", "extra", "pension", "tax", "expense", "med", "ins", "loan", "invest"] + \
+        cols = ["age", "income", "extra", "pension", "tax", "expense", "xexp", "oneoff", "med", "ins", "loan",
+                "invest"] + \
                [f"a{i}" for i in range(len(names))] + ["free", "bucket", "lp", "prop", "debt", "liq", "nw", "real"]
-        heads = ["年齡", "實領薪水", "額外收入", "年金/退休金月領", "稅款結算", "生活支出", "醫療費用", "保險保費",
-                 "貸款支出", "新增投資"] + names + ["活存/現金", "生活費帳戶", "退休金專戶", "不動產", "貸款餘額",
+        heads = ["年齡", "實領薪水", "額外收入", "年金/退休金月領", "稅款結算", "生活支出", "其他固定支出", "一次性收支",
+                 "醫療費用", "保險保費", "貸款支出", "新增投資"] + names + ["活存/現金", "生活費帳戶", "退休金專戶", "不動產", "貸款餘額",
                                                   "淨資產(不含不動產)", "淨資產", "淨資產(今日購買力)"]
         self.res_tree.configure(columns=cols)
         for c, h in zip(cols, heads):
@@ -969,7 +1196,8 @@ class App(tk.Tk):
                 tags.append("retire")
             self.res_tree.insert("", "end", tags=tags, values=[
                 f"{x.age:g}", money(x.income), money(x.extra_income), money(x.pension_income), money(x.tax_settle),
-                money(x.expense), money(x.medical), money(x.insurance), money(x.loan_paid), money(x.invested)] +
+                money(x.expense), money(x.extra_expense), money(x.one_off), money(x.medical), money(x.insurance),
+                money(x.loan_paid), money(x.invested)] +
                 [money(b) for b in x.account_balances] +
                 [money(x.free_cash), money(x.bucket), money(x.lp_balance), money(x.property_value),
                  money(x.loan_balance), money(x.liquid_net_worth), money(x.net_worth), money(x.real_net_worth)])
@@ -1121,19 +1349,36 @@ class App(tk.Tk):
         r = self.results[scn]
         with open(p, "w", newline="", encoding="utf-8-sig") as f:
             w = csv.writer(f)
-            w.writerow(["年齡", "實領薪水", "額外收入", "年金/退休金月領", "稅款結算", "生活支出", "醫療費用", "保險保費",
-                        "貸款支出", "新增投資"] + r.account_names +
+            w.writerow(["年齡", "實領薪水", "額外收入", "年金/退休金月領", "稅款結算", "生活支出", "其他固定支出",
+                        "一次性收支", "醫療費用", "保險保費", "貸款支出", "新增投資"] + r.account_names +
                        ["活存/現金", "生活費帳戶", "退休金專戶", "不動產", "貸款餘額", "淨資產(不含不動產)", "淨資產",
                         "淨資產(今日購買力)"])
             for x in r.rows:
                 w.writerow([x.age, round(x.income), round(x.extra_income), round(x.pension_income),
-                            round(x.tax_settle), round(x.expense), round(x.medical), round(x.insurance),
-                            round(x.loan_paid), round(x.invested)] +
+                            round(x.tax_settle), round(x.expense), round(x.extra_expense), round(x.one_off),
+                            round(x.medical), round(x.insurance), round(x.loan_paid), round(x.invested)] +
                            [round(b) for b in x.account_balances] +
                            [round(x.free_cash), round(x.bucket), round(x.lp_balance), round(x.property_value),
                             round(x.loan_balance), round(x.liquid_net_worth), round(x.net_worth),
                             round(x.real_net_worth)])
         self.status.set(f"已匯出 CSV（{scn}情境）：{p}")
+
+
+    def export_report(self):
+        if not self.results:
+            messagebox.showinfo("提示", "請先按「開始試算」")
+            return
+        p = filedialog.asksaveasfilename(defaultextension=".html", filetypes=[("HTML 報告", "*.html")],
+                                         initialfile="退休收益預測報告.html")
+        if not p:
+            return
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(build_report(self.s, self.results))
+        self.status.set(f"報告已產生：{p}（瀏覽器中可列印或另存 PDF）")
+        try:
+            webbrowser.open("file://" + os.path.abspath(p).replace("\\", "/"))
+        except Exception:
+            pass
 
 
 def main():

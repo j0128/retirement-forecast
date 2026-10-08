@@ -92,6 +92,27 @@ class Property:
 
 
 @dataclass
+class ExtraExpense:
+    """其他固定支出（子女教育、孝親費、旅遊…），有起訖年齡。"""
+    name: str = "額外支出"
+    amount: float = 0.0          # 今日幣值
+    freq: str = "month"          # month / year（年金額平均分攤到每月）
+    start_age: float = 0.0
+    end_age: float = 65.0        # 含起不含迄
+    inflation_adjust: bool = True
+
+
+@dataclass
+class OneOff:
+    """一次性收支：購車、出國、子女教育金、遺產…"""
+    name: str = "一次性收支"
+    kind: str = "out"            # out 支出 / in 收入
+    amount: float = 0.0          # 名目金額
+    age: float = 0.0
+    account: str = ""            # 收入入帳帳戶；空白或找不到 = 活存（支出走一般現金流）
+
+
+@dataclass
 class Settings:
     current_age: float = 35
     retire_age: float = 65
@@ -100,6 +121,8 @@ class Settings:
     salary_withheld: float = 3_000      # 每月預扣所得稅（稅款準備金；每年 5 月結算）
     income_growth: float = 2.0          # 每年調薪 %（實領與預扣同步成長）
     income_tax_rate: float = 5.0        # 年度結算有效稅率 %（課稅所得 = 薪資 + 應稅額外收入）
+    bonus_months: float = 0.0           # 年終/績效獎金（以實領月薪的幾個月計）
+    bonus_month: float = 2              # 獎金發放月份（1~12）
     monthly_expense: float = 30_000     # 目前每月生活支出（今日幣值）
     retire_expense: float = 30_000      # 退休後每月生活支出（今日幣值）
     inflation: float = 2.0              # 通膨率 %
@@ -135,6 +158,8 @@ class Settings:
     extra_incomes: list = field(default_factory=list)
     insurances: list = field(default_factory=list)
     properties: list = field(default_factory=list)
+    extra_expenses: list = field(default_factory=list)
+    one_offs: list = field(default_factory=list)
 
 
 def to_dict(s: Settings) -> dict:
@@ -152,7 +177,8 @@ def _objs(cls, lst) -> list:
 def from_dict(d: dict) -> Settings:
     s = Settings()
     for k, v in d.items():
-        if k in ("accounts", "loans", "lump_stages", "extra_incomes", "insurances", "properties") \
+        if k in ("accounts", "loans", "lump_stages", "extra_incomes", "insurances", "properties",
+                 "extra_expenses", "one_offs") \
                 or not hasattr(s, k):
             continue
         setattr(s, k, v)
@@ -162,6 +188,8 @@ def from_dict(d: dict) -> Settings:
     s.extra_incomes = _objs(ExtraIncome, d.get("extra_incomes"))
     s.insurances = _objs(Insurance, d.get("insurances"))
     s.properties = _objs(Property, d.get("properties"))
+    s.extra_expenses = _objs(ExtraExpense, d.get("extra_expenses"))
+    s.one_offs = _objs(OneOff, d.get("one_offs"))
     if "lump_stages" in d:
         s.lump_stages = _stages(d["lump_stages"])
     s.accounts = []
@@ -238,6 +266,11 @@ def validate(s: Settings) -> list[str]:
     for x in s.insurances:
         if x.end_age <= x.start_age:
             errs.append(f"保險「{x.name}」結束年齡需大於起始年齡")
+    for x in s.extra_expenses:
+        if x.end_age <= x.start_age:
+            errs.append(f"額外支出「{x.name}」結束年齡需大於起始年齡")
+    if not 1 <= s.bonus_month <= 12:
+        errs.append("獎金發放月份需介於 1~12")
     for l in s.loans:
         try:
             a, b = parse_ym(l.start), parse_ym(l.end)
@@ -262,6 +295,8 @@ class Row:
     extra_income: float      # 該年額外收入
     insurance: float         # 該年保險保費
     medical: float           # 該年醫療費用
+    extra_expense: float     # 該年其他固定支出
+    one_off: float           # 該年一次性收支淨額（收入為正）
     tax_settle: float        # 該年稅款結算（正 = 退稅，負 = 補稅）
     loan_paid: float
     invested: float          # 該年新增投資
@@ -389,7 +424,7 @@ def simulate(s: Settings, today: Optional[dt.date] = None, return_delta: float =
     rows = []
     depleted = None
     y_income = y_pension = y_exp = y_loan = y_inv = 0.0
-    y_extra = y_ins = y_med = y_tax = 0.0
+    y_extra = y_ins = y_med = y_tax = y_xexp = y_oneoff = 0.0
     retire_nw = retire_real = 0.0
     surplus_now = None
     names = [a.name for a in accs]
@@ -475,6 +510,10 @@ def simulate(s: Settings, today: Optional[dt.date] = None, return_delta: float =
                 base = s.lp_wage * gf if s.lp_wage > 0 else net_salary + withheld
                 wage = min(base, s.lp_wage_cap)
                 lp += wage * s.lp_employer_pct / 100 + wage * s.lp_self_pct / 100  # 自提已含在實領薪水的扣款中
+        if not retired and s.bonus_months > 0 and cal_month == int(s.bonus_month):
+            bonus = net_salary * s.bonus_months
+            net_salary += bonus
+            taxable_inc += bonus
         extra = 0.0
         for x in s.extra_incomes:
             if x.start_age <= age < x.end_age:
@@ -519,6 +558,20 @@ def simulate(s: Settings, today: Optional[dt.date] = None, return_delta: float =
         if age >= s.medical_start_age and s.medical_monthly > 0:
             medical = s.medical_monthly * infl * (1 + s.medical_growth / 100) ** (age - s.medical_start_age)
 
+        # 其他固定支出、一次性收支
+        extra_exp = 0.0
+        for x in s.extra_expenses:
+            if x.start_age <= age < x.end_age:
+                extra_exp += x.amount / (12 if x.freq == "year" else 1) * (infl if x.inflation_adjust else 1.0)
+        one_in = one_out = 0.0
+        for x in s.one_offs:
+            if x.amount > 0 and m == int(round((x.age - s.current_age) * 12)):
+                if x.kind == "in":
+                    one_in += x.amount
+                    credit(x.amount, x.account)
+                else:
+                    one_out += x.amount
+
         # 保險：保費、滿期金
         insurance = 0.0
         for x in s.insurances:
@@ -547,7 +600,7 @@ def simulate(s: Settings, today: Optional[dt.date] = None, return_delta: float =
                 bal[i] += adds[i]
                 invested += adds[i]
 
-        outflow = expense + medical + insurance + loan_paid
+        outflow = expense + medical + insurance + loan_paid + extra_exp + one_out
         if not retired:
             cash_flow = net_salary + extra + pension + tax_settle - outflow - invested
             if m == 0:
@@ -586,6 +639,8 @@ def simulate(s: Settings, today: Optional[dt.date] = None, return_delta: float =
         y_extra += extra
         y_ins += insurance
         y_med += medical
+        y_xexp += extra_exp
+        y_oneoff += one_in - one_out
         y_tax += tax_settle
 
         def prop_value(mm):
@@ -599,13 +654,13 @@ def simulate(s: Settings, today: Optional[dt.date] = None, return_delta: float =
             rows.append(Row(
                 age=round(s.current_age + (m + 1) / 12, 2),
                 income=y_income, pension_income=y_pension, expense=y_exp, extra_income=y_extra,
-                insurance=y_ins, medical=y_med, tax_settle=y_tax,
+                insurance=y_ins, medical=y_med, extra_expense=y_xexp, one_off=y_oneoff, tax_settle=y_tax,
                 loan_paid=y_loan, invested=y_inv,
                 account_balances=list(bal), free_cash=free, bucket=bucket, lp_balance=lp,
                 loan_balance=loan_bal, property_value=pv, net_worth=nw,
                 real_net_worth=nw / (infl_m ** (m + 1)), liquid_net_worth=liquid))
             y_income = y_pension = y_exp = y_loan = y_inv = 0.0
-            y_extra = y_ins = y_med = y_tax = 0.0
+            y_extra = y_ins = y_med = y_tax = y_xexp = y_oneoff = 0.0
         if m + 1 == retire_m:
             retire_nw = (sum(bal) + free + bucket + lp - loan_bal + prop_value(m + 1)
                          + s.employer_lump)  # 含退休當月入帳的雇主退休金

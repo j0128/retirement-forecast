@@ -5,7 +5,7 @@ import sys
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from forecast.engine import (Account, ExtraIncome, Insurance, Loan, Property, Settings, Stage,
+from forecast.engine import (Account, ExtraExpense, ExtraIncome, OneOff, Insurance, Loan, Property, Settings, Stage,
                              simulate_scenarios, stage_at, annuity_payment, from_dict,
                              labor_insurance_monthly, simulate, to_dict, parse_ym)
 
@@ -232,6 +232,47 @@ class EngineTests(unittest.TestCase):
     def test_new_lists_roundtrip(self):
         s = base(extra_incomes=[ExtraIncome()], insurances=[Insurance()], properties=[Property()])
         self.assertEqual(to_dict(s), to_dict(from_dict(to_dict(s))))
+
+    def test_bonus_paid_in_month_and_taxed(self):
+        s = base(current_age=30, retire_age=40, life_expectancy=41, salary_net=50_000, bonus_months=2,
+                 bonus_month=2, income_tax_rate=10, savings_cash=1_000_000)
+        r = simulate(s, TODAY)   # 2026-01 起：每年 2 月發 2 個月
+        self.assertAlmostEqual(r.rows[0].income, 50_000 * 12 + 100_000, delta=1)
+        # 獎金計入課稅所得：2026 年課稅 (600,000 + 100,000) × 10%，預扣 0 → 補稅
+        self.assertAlmostEqual(r.rows[1].tax_settle, -70_000 - 0, delta=1)
+
+    def test_extra_expense_period_and_inflation(self):
+        x = ExtraExpense("子女教育", 120_000, "year", 30, 32, inflation_adjust=False)
+        s = base(current_age=30, retire_age=40, life_expectancy=41, extra_expenses=[x], savings_cash=1_000_000)
+        r = simulate(s, TODAY)
+        self.assertAlmostEqual(sum(y.extra_expense for y in r.rows), 240_000, delta=1)
+        x.inflation_adjust = True
+        s.inflation = 10
+        r2 = simulate(s, TODAY)
+        self.assertGreater(sum(y.extra_expense for y in r2.rows), 240_000)
+
+    def test_one_off_in_and_out(self):
+        s = base(current_age=30, retire_age=40, life_expectancy=41, savings_cash=1_000_000,
+                 accounts=[Account("a", 0, [Stage(0, 120, 0, 0)])],
+                 one_offs=[OneOff("購車", "out", 500_000, 31), OneOff("遺產", "in", 2_000_000, 35, "a")])
+        r = simulate(s, TODAY)
+        self.assertAlmostEqual(sum(y.one_off for y in r.rows), 1_500_000, delta=1)
+        self.assertAlmostEqual(r.rows[-1].account_balances[0], 2_000_000, delta=1)
+        self.assertAlmostEqual(r.rows[-1].free_cash, 500_000, delta=1)
+
+    def test_new_lists_roundtrip2(self):
+        s = base(extra_expenses=[ExtraExpense()], one_offs=[OneOff()])
+        self.assertEqual(to_dict(s), to_dict(from_dict(to_dict(s))))
+
+    def test_report_builds(self):
+        from forecast.report import build_report
+        s = base(accounts=[Account.simple("股票", 1_000_000, 0, 5, 100)], retire_age=40, life_expectancy=45,
+                 properties=[Property("自宅", 5_000_000)])
+        html = build_report(s, simulate_scenarios(s, TODAY))
+        self.assertIn("退休收益預測報告", html)
+        self.assertIn("<svg", html)
+        self.assertIn("自宅", html)
+        self.assertIn("悲觀", html)
 
     def test_roundtrip_and_validation(self):
         s = base(accounts=[Account.simple("a", 1, 2, 3, 4)], loans=[Loan("x", start="2020-01", end="2030-01")])
