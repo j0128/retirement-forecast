@@ -77,6 +77,7 @@ class Settings:
     lp_balance: float = 0.0             # 帳戶現有餘額
     lp_return: float = 3.0              # 帳戶年收益率 %
     lp_claim_age: float = 65
+    employer_lump: float = 0.0          # 雇主另給的退休金（退休時一次領，名目金額，轉入退休金帳戶）
     lp_lump_sum: bool = True            # True 一次領（轉入退休金帳戶）；False 月領
     lump_stages: list = field(default_factory=lambda: [Stage(0.0, 120.0, 4.0, 0.0)])  # 退休金帳戶投資階段
     # 勞保老年年金
@@ -233,7 +234,7 @@ def simulate(s: Settings, today: Optional[dt.date] = None) -> Result:
     # 帳戶
     accs = list(s.accounts)
     lump_idx = None
-    if s.lp_enabled and s.lp_lump_sum:  # 勞退一次領 → 退休金帳戶（排在投資帳戶之後）
+    if (s.lp_enabled and s.lp_lump_sum) or s.employer_lump > 0:  # 一次領 → 退休金帳戶（排在投資帳戶之後）
         accs.append(Account("退休金帳戶", 0.0, s.lump_stages))
         lump_idx = len(accs) - 1
     n_real = len(s.accounts)
@@ -377,6 +378,10 @@ def simulate(s: Settings, today: Optional[dt.date] = None) -> Result:
                 lp += self_contrib
                 net_salary -= self_contrib
 
+        # 雇主另給的退休金：退休當月進入退休金帳戶
+        if s.employer_lump > 0 and m == retire_m:
+            bal[lump_idx] += s.employer_lump
+
         # 勞退領取
         pension = 0.0
         if lp_enabled and m == claim_m:
@@ -453,11 +458,11 @@ def simulate(s: Settings, today: Optional[dt.date] = None) -> Result:
                 loan_balance=loan_bal, net_worth=nw, real_net_worth=real))
             y_income = y_pension = y_exp = y_loan = y_inv = 0.0
         if m + 1 == retire_m:
-            retire_nw = sum(bal) + free + bucket + lp - loan_bal
+            retire_nw = sum(bal) + free + bucket + lp - loan_bal + s.employer_lump  # 含退休當月入帳的雇主退休金
             retire_real = retire_nw / (infl_m ** (m + 1))
 
     if retire_m == 0:
-        retire_nw = sum(a.cash for a in s.accounts) + s.savings_cash + s.lp_balance
+        retire_nw = sum(a.cash for a in s.accounts) + s.savings_cash + s.lp_balance + s.employer_lump
         retire_real = retire_nw
         retire_real = retire_nw
     if s.lp_enabled and s.lp_claim_age < s.retire_age:

@@ -144,6 +144,19 @@ class EngineTests(unittest.TestCase):
         r = simulate(s, TODAY)
         self.assertAlmostEqual(r.rows[-1].net_worth, 1_000_000, delta=1)  # 年金正好支應生活費
 
+    def test_employer_lump_goes_to_retirement_account(self):
+        s = base(employer_lump=2_000_000, lump_stages=[Stage(0, 120, 0, 0)], life_expectancy=70)
+        r = simulate(s, TODAY)
+        self.assertEqual(r.account_names, ["退休金帳戶"])
+        self.assertAlmostEqual(r.rows[-1].account_balances[0], 2_000_000, delta=1)
+        self.assertAlmostEqual(r.retire_net_worth, 2_000_000, delta=1)
+
+    def test_employer_lump_with_labor_pension_lump(self):
+        s = base(employer_lump=1_000_000, lp_enabled=True, lp_balance=500_000, lp_return=0, lp_employer_pct=0,
+                 lp_claim_age=60, lp_lump_sum=True, lump_stages=[Stage(0, 120, 0, 0)], life_expectancy=70)
+        r = simulate(s, TODAY)
+        self.assertAlmostEqual(r.rows[-1].account_balances[0], 1_500_000, delta=1)
+
     def test_roundtrip_and_validation(self):
         s = base(accounts=[Account.simple("a", 1, 2, 3, 4)], loans=[Loan("x", start="2020-01", end="2030-01")])
         s2 = from_dict(to_dict(s))
