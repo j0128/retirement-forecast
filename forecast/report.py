@@ -122,6 +122,15 @@ def build_report(s: Settings, results: dict) -> str:
                  money(x.property_value), money(x.liquid_net_worth), money(x.net_worth), money(x.real_net_worth)]
         body += f"<tr{cls}>" + "".join(f"<td class='r'>{c}</td>" for c in cells) + "</tr>"
     head_html = "".join(f"<th>{h}</th>" for h in heads)
+    cf = base.cashflow
+    inc = cf["salary"] + cf["extra"] + cf["pension"] + cf["tax"] + cf["oneoff"]
+    out = cf["living"] + cf["xexp"] + cf["insurance"] + cf["loan"] + cf["medical"] + cf["invest"]
+    cf_rows = [("實領薪水", cf["salary"]), ("額外收入", cf["extra"]), ("年金 / 退休金月領", cf["pension"]),
+               ("稅款結算", cf["tax"]), ("一次性收支淨額", cf["oneoff"]), ("收入合計", inc),
+               ("生活支出", cf["living"]), ("其他固定支出", cf["xexp"]), ("保險保費", cf["insurance"]),
+               ("貸款還款", cf["loan"]), ("醫療費用", cf["medical"]), ("每月投資加碼", cf["invest"]),
+               ("支出與投資合計", out), ("每月淨現金流", inc - out)]
+    cf_html = "".join(f"<tr><th>{e(a)}</th><td class='r'>{money(b)}</td></tr>" for a, b in cf_rows)
     sales = base.property_sales
     sales_html = ""
     if sales:
@@ -161,6 +170,7 @@ td.r{{text-align:right}} tr.ret td{{background:#fff4d6}}
 <h2>淨資產走勢（含不動產，名目金額）</h2><div class="card">{_svg_chart(results, s.retire_age)}</div>
 <h2>情境比較</h2><div class="card"><table><thead><tr><th>情境</th><th>退休時淨資產</th><th>壽命時淨資產</th>
 <th>壽命時（不含不動產）</th><th>資產耗盡</th></tr></thead><tbody>{sc_rows}</tbody></table></div>
+<h2>目前每月現金流明細（第一年平均）</h2><div class="card"><table class="assume">{cf_html}</table></div>
 {sales_html}<h2>主要假設</h2><div class="card"><table class="assume">{assume_html}</table></div>
 {f'<h2>提醒</h2><div class="card"><ul>{warn}</ul></div>' if warn else ''}
 <h2>逐年明細（基準情境）</h2><div class="card"><table><thead><tr>{head_html}</tr></thead><tbody>{body}</tbody></table></div>

@@ -715,7 +715,8 @@ class App(tk.Tk):
                 anchor="w", padx=16, pady=(0, 4))
         wrap = tk.Frame(card, bg=C["card"])
         wrap.pack(fill="x", padx=16, pady=(4, 14))
-        tree = ttk.Treeview(wrap, columns=cols, show="headings", height=min(height, 6), selectmode="none")
+        tree = ttk.Treeview(wrap, columns=cols, show="headings", height=height if height > 6 else min(height, 6),
+                            selectmode="none")
         xs = ttk.Scrollbar(wrap, orient="horizontal", command=tree.xview)
         tree.configure(xscrollcommand=xs.set)
         for c, h in zip(cols, heads):
@@ -786,6 +787,13 @@ class App(tk.Tk):
             v.pack(fill="x")
             s.pack(fill="x")
             self.stats.append((t, v, s))
+        self.cf_tree = self._table_card(
+            p, "目前每月現金流明細（第一年平均，已把年繳項目平均到每月）", ("item", "amt"), ("項目", "每月平均 NT$"),
+            "用來對照你自己的算法：收入 − 支出 − 投資加碼 = 每月淨現金流。", 200, 11)
+        self.cf_tree.column("item", width=260, anchor="w")
+        self.cf_tree.column("amt", width=180, anchor="e")
+        self.cf_tree.tag_configure("head", background="#E8EEF8", foreground=C["navy"])
+        self.cf_tree.tag_configure("total", background="#FFF4D6")
         self.alert = tk.Label(p, text="", bg=C["bg"], fg=C["warn"], anchor="w", justify="left",
                               font=self.fonts["small"], wraplength=1000)
         self.alert.pack(fill="x", pady=(6, 0))
@@ -1384,7 +1392,25 @@ class App(tk.Tk):
         self.sc_note.config(text=f"悲觀 / 樂觀：投資帳戶（含退休金帳戶）報酬率 ∓ {d:g} 個百分點；淨資產含不動產。")
         self._fill_table()
         self._fill_sales(r)
+        self._fill_cashflow(r)
         self._draw_chart()
+
+    def _fill_cashflow(self, r: Result):
+        cf = r.cashflow
+        tree = self.cf_tree
+        tree.delete(*tree.get_children())
+        inc = cf["salary"] + cf["extra"] + cf["pension"] + cf["tax"] + cf["oneoff"]
+        out = (cf["living"] + cf["xexp"] + cf["insurance"] + cf["loan"] + cf["medical"] + cf["invest"])
+        rows = [("收入", None, "head"), ("　實領薪水", cf["salary"], ""), ("　額外收入", cf["extra"], ""),
+                ("　年金 / 退休金月領", cf["pension"], ""), ("　稅款結算（退稅＋ / 補稅－）", cf["tax"], ""),
+                ("　一次性收支淨額", cf["oneoff"], ""), ("　收入合計", inc, "head"),
+                ("支出與投資", None, "head"), ("　生活支出", cf["living"], ""),
+                ("　其他固定支出（旅遊、教育、稅務…）", cf["xexp"], ""), ("　保險保費", cf["insurance"], ""),
+                ("　貸款還款", cf["loan"], ""), ("　醫療費用", cf["medical"], ""), ("　每月投資加碼", cf["invest"], ""),
+                ("　支出與投資合計", out, "head"), ("每月淨現金流", inc - out, "total")]
+        tree.configure(height=len(rows))
+        for name, v, tag in rows:
+            tree.insert("", "end", values=(name, "" if v is None else money(v)), tags=(tag,) if tag else ())
 
     def _fill_table(self):
         res = getattr(self, "results", None)

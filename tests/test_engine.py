@@ -355,6 +355,16 @@ class EngineTests(unittest.TestCase):
         self.assertAlmostEqual(sum(y.extra_expense for y in r.rows), 10_000 * 60, delta=1)
         self.assertTrue(all(y.extra_expense == 0 for y in r.rows if y.age > 35))
 
+    def test_monthly_cashflow_averages_yearly_items(self):
+        ins = Insurance("險", 12_000, "year", 30, 40)
+        xe = ExtraExpense("旅遊", 24_000, "year", 30, 40, False)
+        s = base(current_age=30, retire_age=40, life_expectancy=41, salary_net=10_000, insurances=[ins],
+                 extra_expenses=[xe], savings_cash=1_000_000)
+        r = simulate(s, TODAY)
+        self.assertAlmostEqual(r.monthly_surplus_now, 10_000 - 1_000 - 2_000, delta=1)   # 年繳平均到每月
+        self.assertAlmostEqual(r.cashflow["insurance"], 1_000, delta=1)
+        self.assertAlmostEqual(r.cashflow["xexp"], 2_000, delta=1)
+
     def test_report_builds(self):
         from forecast.report import build_report
         s = base(accounts=[Account.simple("股票", 1_000_000, 0, 5, 100)], retire_age=40, life_expectancy=45,

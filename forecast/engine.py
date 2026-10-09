@@ -351,6 +351,7 @@ class Result:
     monthly_surplus_now: float
     warnings: list
     property_sales: list = field(default_factory=list)   # 不動產出售明細（dict 清單）
+    cashflow: dict = field(default_factory=dict)         # 第一年「平均每月」現金流明細
 
 
 def simulate(s: Settings, today: Optional[dt.date] = None, return_delta: float = 0.0) -> Result:
@@ -457,6 +458,8 @@ def simulate(s: Settings, today: Optional[dt.date] = None, return_delta: float =
     y_extra = y_ins = y_med = y_tax = y_xexp = y_oneoff = 0.0
     retire_nw = retire_real = 0.0
     surplus_now = None
+    fy = {k: 0.0 for k in ("salary", "extra", "pension", "tax", "living", "xexp", "insurance", "loan", "medical",
+                           "oneoff", "invest")}
     names = [a.name for a in accs]
     tax_year: dict = {}          # 日曆年 -> [已預扣, 課稅所得]
     prop_sold = [False] * len(s.properties)
@@ -739,8 +742,12 @@ def simulate(s: Settings, today: Optional[dt.date] = None, return_delta: float =
 
         flow[1] += invested   # 每月投資加碼一律由預設現金流支應
         outflow = expense + medical + insurance + loan_paid + extra_exp + one_out
-        if m == 0:
-            surplus_now = net_salary + extra + pension + tax_settle - outflow - invested
+        if m < 12:
+            for k_, v_ in (("salary", net_salary), ("extra", extra), ("pension", pension), ("tax", tax_settle),
+                           ("living", expense), ("xexp", extra_exp), ("insurance", insurance),
+                           ("loan", loan_paid), ("medical", medical), ("oneoff", one_in - one_out),
+                           ("invest", invested)):
+                fy[k_] += v_
         net = flow[0] - flow[1]
         if not retired:
             if net >= 0:
@@ -809,13 +816,18 @@ def simulate(s: Settings, today: Optional[dt.date] = None, return_delta: float =
         retire_real = retire_nw
     if s.lp_enabled and s.lp_claim_age < s.retire_age:
         warnings.append("勞退請領年齡早於退休年齡，已視為退休時才請領")
-    if surplus_now is not None and surplus_now < 0 and s.retire_age > s.current_age:
+    n_fy = max(min(12, total_m), 1)
+    cashflow = {k: v / n_fy for k, v in fy.items()}
+    surplus_now = (cashflow["salary"] + cashflow["extra"] + cashflow["pension"] + cashflow["tax"]
+                   + cashflow["oneoff"] - cashflow["living"] - cashflow["xexp"] - cashflow["insurance"]
+                   - cashflow["loan"] - cashflow["medical"] - cashflow["invest"])
+    if surplus_now < 0 and s.retire_age > s.current_age:
         warnings.append("目前每月現金流為負，不足部分會動用活存/投資帳戶")
     return Result(rows=rows, account_names=[a.name for a in accs],
                   retire_net_worth=retire_nw, retire_real_net_worth=retire_real,
                   depleted_age=depleted, li_monthly=li_pay, lp_monthly=lp_pay,
                   lp_at_claim=lp_at_claim, monthly_surplus_now=surplus_now or 0.0,
-                  warnings=warnings, property_sales=property_sales)
+                  warnings=warnings, property_sales=property_sales, cashflow=cashflow)
 
 
 def simulate_scenarios(s: Settings, today: Optional[dt.date] = None) -> dict:
