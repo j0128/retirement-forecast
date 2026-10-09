@@ -136,6 +136,7 @@ class EngineTests(unittest.TestCase):
     def test_bucket_default_and_inflation(self):
         self.assertEqual(Settings().bucket_amount, 1_800_000)
         s = base(retire_age=30, retire_expense=0, bucket_amount=100_000, inflation=10, life_expectancy=33,
+                 bucket_inflate=True,
                  accounts=[Account("a", 5_000_000, [Stage(0, 120, 0, 0)])])
         r = simulate(s, TODAY)
         self.assertAlmostEqual(r.rows[0].bucket, 110_000, delta=1)   # 第 2 年年初補到 100k×1.1
@@ -364,6 +365,18 @@ class EngineTests(unittest.TestCase):
         self.assertAlmostEqual(r.monthly_surplus_now, 10_000 - 1_000 - 2_000, delta=1)   # 年繳平均到每月
         self.assertAlmostEqual(r.cashflow["insurance"], 1_000, delta=1)
         self.assertAlmostEqual(r.cashflow["xexp"], 2_000, delta=1)
+
+    def test_bucket_fixed_by_default(self):
+        s = base(retire_age=30, retire_expense=0, bucket_amount=100_000, inflation=10, life_expectancy=33,
+                 accounts=[Account("a", 5_000_000, [Stage(0, 120, 0, 0)])])
+        r = simulate(s, TODAY)
+        self.assertAlmostEqual(r.rows[1].bucket, 100_000, delta=1)
+
+    def test_fixed_monthly_labor_pension_contribution(self):
+        s = base(current_age=30, retire_age=31, life_expectancy=32, lp_enabled=True, lp_monthly_add=17_000,
+                 lp_return=0, lp_employer_pct=6, lp_claim_age=31, lp_lump_sum=False, salary_net=100_000)
+        r = simulate(s, TODAY)
+        self.assertAlmostEqual(r.lp_at_claim, 17_000 * 12, delta=1)   # 固定金額取代比例
 
     def test_report_builds(self):
         from forecast.report import build_report

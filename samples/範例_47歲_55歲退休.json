@@ -1,0 +1,150 @@
+{
+ "current_age": 47,
+ "retire_age": 55,
+ "life_expectancy": 90,
+ "salary_net": 120000,
+ "salary_withheld": 0,
+ "income_growth": 0,
+ "income_tax_rate": 0,
+ "salary_account": "",
+ "pension_account": "",
+ "expense_account": "",
+ "bonus_months": 0.0,
+ "bonus_month": 2,
+ "monthly_expense": 20000,
+ "retire_expense": 20000,
+ "inflation": 2.0,
+ "gains_tax_rate": 0.0,
+ "savings_cash": 0,
+ "savings_rate": 1,
+ "bucket_amount": 2000000,
+ "bucket_inflate": false,
+ "lp_enabled": true,
+ "lp_wage": 0.0,
+ "lp_wage_cap": 150000,
+ "lp_monthly_add": 17000,
+ "lp_employer_pct": 6.0,
+ "lp_self_pct": 0.0,
+ "lp_balance": 3070000,
+ "lp_return": 11,
+ "lp_claim_age": 55,
+ "employer_lump": 2000000,
+ "lp_lump_sum": true,
+ "lump_stages": [
+  {
+   "start_age": 0,
+   "end_age": 120,
+   "annual_return": 10,
+   "monthly_add": 0
+  }
+ ],
+ "li_enabled": false,
+ "li_avg_wage": 45800,
+ "li_years_now": 0.0,
+ "li_claim_age": 65,
+ "li_manual_monthly": 0.0,
+ "medical_start_age": 70,
+ "medical_monthly": 0,
+ "medical_growth": 2.0,
+ "scenario_delta": 2.0,
+ "accounts": [
+  {
+   "name": "投資",
+   "cash": 630000,
+   "stages": [
+    {
+     "start_age": 47,
+     "end_age": 120,
+     "annual_return": 10,
+     "monthly_add": 50000
+    }
+   ]
+  }
+ ],
+ "loans": [
+  {
+   "name": "房貸",
+   "mode": "amort",
+   "monthly_payment": 0.0,
+   "principal": 8750000,
+   "annual_rate": 2.2,
+   "pay_account": "",
+   "start": "2026-10",
+   "end": "",
+   "years": 30
+  }
+ ],
+ "extra_incomes": [
+  {
+   "name": "額外收入",
+   "amount": 55000,
+   "freq": "month",
+   "start_age": 47,
+   "end_age": 55,
+   "growth": 0,
+   "taxable": false,
+   "account": ""
+  }
+ ],
+ "insurances": [
+  {
+   "name": "保險",
+   "premium": 60000,
+   "freq": "year",
+   "start_age": 47,
+   "end_age": 90,
+   "inflation_adjust": false,
+   "pay_account": "",
+   "payout": 0.0,
+   "payout_age": 0.0,
+   "payout_to": ""
+  }
+ ],
+ "properties": [],
+ "extra_expenses": [
+  {
+   "name": "固定支出",
+   "amount": 40000,
+   "freq": "month",
+   "start_age": 47,
+   "end_age": 90,
+   "inflation_adjust": true,
+   "pay_account": ""
+  },
+  {
+   "name": "旅遊",
+   "amount": 150000,
+   "freq": "year",
+   "start_age": 47,
+   "end_age": 90,
+   "inflation_adjust": true,
+   "pay_account": ""
+  },
+  {
+   "name": "稅務",
+   "amount": 50000,
+   "freq": "year",
+   "start_age": 47,
+   "end_age": 90,
+   "inflation_adjust": true,
+   "pay_account": ""
+  }
+ ],
+ "one_offs": [],
+ "policies": [
+  {
+   "account": "活存",
+   "mode": "cap",
+   "limit": 0,
+   "overflow_to": "投資",
+   "refill_from": ""
+  },
+  {
+   "account": "生活費帳戶",
+   "mode": "fixed",
+   "limit": 0,
+   "overflow_to": "投資",
+   "refill_from": ""
+  }
+ ]
+}

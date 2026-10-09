@@ -96,7 +96,7 @@ def build_report(s: Settings, results: dict) -> str:
                          f"{x.start_age:g}–{x.end_age:g} 歲）" for x in s.insurances) or "無"),
         ("貸款", "、".join(l.name for l in s.loans) or "無"),
         ("不動產", "、".join(f"{p.name}（{money(p.value)}）" for p in s.properties) or "無"),
-        ("退休後生活費帳戶", f"每年年初補足 NT$ {money(s.bucket_amount)}（今日幣值）"),
+        ("退休後生活費帳戶", f"每年年初補足 NT$ {money(s.bucket_amount)}" + ("（今日幣值，隨通膨調整）" if s.bucket_inflate else "")),
         ("醫療費用", f"{s.medical_start_age:g} 歲起每月 NT$ {money(s.medical_monthly)}（今日幣值），每年多成長 {s.medical_growth:g}%"),
         ("情境", f"悲觀 / 樂觀 = 投資報酬率 ∓ {s.scenario_delta:g} 個百分點"),
     ]

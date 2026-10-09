@@ -345,9 +345,10 @@ class App(tk.Tk):
         "monthly_expense": ("目前每月生活支出（今日幣值）", "NT$/月"),
         "retire_expense": ("退休後每月生活支出（今日幣值）", "NT$/月"),
         "inflation": ("通膨率", "%/年"),
-        "bucket_amount": ("每年年初補足金額（今日幣值）", "NT$"),
+        "bucket_amount": ("每年年初補足金額", "NT$"),
         "savings_cash": ("活存現金（未投入）", "NT$"), "savings_rate": ("活存年利率", "%"),
         "gains_tax_rate": ("投資獲利稅率", "%"),
+        "lp_monthly_add": ("每月固定提繳金額（>0 則取代下方比例）", "NT$/月"),
         "lp_wage": ("提繳工資（0 = 以實領+預扣稅估算）", "NT$/月"), "lp_wage_cap": ("提繳工資上限", "NT$/月"),
         "lp_employer_pct": ("雇主/學校提繳", "%"), "lp_self_pct": ("個人提繳（自提）", "%"),
         "lp_balance": ("專戶現有餘額", "NT$"), "lp_return": ("專戶年收益率（累積/月領期）", "%"),
@@ -581,9 +582,14 @@ class App(tk.Tk):
         left, right = self._two_cols(cols)
         self._card(left, "個人資料", ("current_age", "retire_age", "life_expectancy"))
         self._card(left, "現金與投資稅", ("savings_cash", "savings_rate", "gains_tax_rate"))
+        def _bucket_extra(c):
+            self.vars["bucket_inflate"] = tk.BooleanVar()
+            c.widget(ttk.Checkbutton(c, text="額度視為今日幣值，隨通膨逐年調高", variable=self.vars["bucket_inflate"]),
+                     pady=(2, 2))
         self._card(right, "退休後生活費帳戶", ("bucket_amount",),
-                   hint="退休後每年年初，依投資帳戶清單順序提領，把此帳戶補足到設定金額；"
-                        "年金與退休金月領先進此帳戶，生活費與貸款由此支出。")
+                   hint="退休後每年年初，把此帳戶補足到設定金額（來源與超出流向可在「資金流向」頁指定）；"
+                        "年金與退休金月領先進此帳戶，生活費與貸款由此支出。",
+                   extra=_bucket_extra)
         self._card(right, "醫療費用", ("medical_start_age", "medical_monthly", "medical_growth"),
                    hint="從起算年齡起每月加計醫療費用，並以高於一般通膨的幅度逐年成長。填 0 表示不計。")
         self._card(right, "情境設定", ("scenario_delta",),
@@ -643,8 +649,8 @@ class App(tk.Tk):
                   hint="提繳比例請依薪資單設定。一次領會在請領時轉入「退休金帳戶」繼續投資。")
         self.vars["lp_enabled"] = tk.BooleanVar()
         c1.widget(ttk.Checkbutton(c1, text="計入退休金專戶", variable=self.vars["lp_enabled"]), pady=(2, 2))
-        for k in ("lp_wage", "lp_wage_cap", "lp_employer_pct", "lp_self_pct", "lp_balance", "lp_return",
-                  "lp_claim_age"):
+        for k in ("lp_balance", "lp_return", "lp_monthly_add", "lp_wage", "lp_wage_cap", "lp_employer_pct",
+                  "lp_self_pct", "lp_claim_age"):
             self._money_entry(c1, k)
         self.vars["lp_lump_sum"] = tk.StringVar()
         c1.field("領取方式", None, "", widget=ttk.Combobox(c1, textvariable=self.vars["lp_lump_sum"],
@@ -1213,7 +1219,7 @@ class App(tk.Tk):
         for i, name in enumerate(self._acct_choices()):
             p_ = self._policy_of(name)
             if name == BUCKET:
-                rule, amt = "固定額度（退休後每年年初）", f"{money(self.s.bucket_amount)}（今日幣值）"
+                rule, amt = "固定額度（退休後每年年初）", money(self.s.bucket_amount) + ("（今日幣值）" if self.s.bucket_inflate else "")
                 over = (p_.overflow_to if p_ and p_.overflow_to else "不轉出")
                 src = (p_.refill_from if p_ and p_.refill_from else "依投資帳戶清單順序")
             elif p_ and p_.mode != "none":
@@ -1251,7 +1257,8 @@ class App(tk.Tk):
                 rules.append(f"  • 「{p_.account}」每年 1 月調整為 {money(p_.limit)}"
                              f"（不足由「{p_.refill_from or '投資帳戶依序'}」補，超出轉入「{p_.overflow_to or '不轉出'}」）")
         bp = self._policy_of(BUCKET)
-        rules.append(f"  • 「生活費帳戶」退休後每年年初補足到 {money(s.bucket_amount)}（今日幣值）"
+        rules.append(f"  • 「生活費帳戶」退休後每年年初補足到 {money(s.bucket_amount)}"
+                     f"{'（今日幣值，隨通膨調整）' if s.bucket_inflate else ''}"
                      f"，來源：{(bp.refill_from if bp and bp.refill_from else '投資帳戶依序')}"
                      f"，超出：{(bp.overflow_to if bp and bp.overflow_to else '不轉出')}")
         lines += ["", "【帳戶規則】"] + rules
@@ -1269,7 +1276,7 @@ class App(tk.Tk):
         over = p_.overflow_to if p_.overflow_to in others else none_over
         src = p_.refill_from if p_.refill_from in others else none_src
         if name == BUCKET:
-            fields = [("limit", "每年年初補足金額 NT$（今日幣值）", "num", self.s.bucket_amount),
+            fields = [("limit", "每年年初補足金額 NT$", "num", self.s.bucket_amount),
                       ("refill_from", "不足時由哪個帳戶補足", "choice", src, src_ch),
                       ("overflow_to", "超出部分流向", "choice", over, over_ch)]
         else:

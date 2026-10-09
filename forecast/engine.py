@@ -151,11 +151,13 @@ class Settings:
     gains_tax_rate: float = 0.0         # 投資獲利稅率 %
     savings_cash: float = 0.0           # 活存/未投入現金
     savings_rate: float = 1.0           # 活存年利率 %
-    bucket_amount: float = 1_800_000    # 退休後「生活費帳戶」每年年初補足到此金額（今日幣值，隨通膨調整）
+    bucket_amount: float = 1_800_000    # 退休後「生活費帳戶」每年年初補足到此金額
+    bucket_inflate: bool = False        # True = 額度視為今日幣值並隨通膨調整；False = 固定金額
     # 勞退新制
     lp_enabled: bool = True
     lp_wage: float = 0.0                # 提繳工資；0 = 取月收入
     lp_wage_cap: float = LABOR_PENSION_WAGE_CAP  # 提繳工資上限
+    lp_monthly_add: float = 0.0         # 每月固定提繳金額（>0 時取代下方比例計算）
     lp_employer_pct: float = 6.0
     lp_self_pct: float = 0.0            # 自提 0~6%
     lp_balance: float = 0.0             # 帳戶現有餘額
@@ -567,7 +569,7 @@ def simulate(s: Settings, today: Optional[dt.date] = None, return_delta: float =
     def refill(m_next):
         """每年年初：把生活費帳戶補足到設定金額（隨通膨調整）；超出的部分依規則轉出。"""
         nonlocal bucket
-        target = s.bucket_amount * infl_m ** m_next
+        target = s.bucket_amount * (infl_m ** m_next if s.bucket_inflate else 1.0)
         p_ = pol.get(BUCKET)
         if bucket < target:
             if p_ and valid(p_.refill_from) and p_.refill_from != BUCKET:
@@ -623,9 +625,12 @@ def simulate(s: Settings, today: Optional[dt.date] = None, return_delta: float =
             withheld = s.salary_withheld * gf
             taxable_inc = net_salary + withheld
             if s.lp_enabled:
-                base = s.lp_wage * gf if s.lp_wage > 0 else net_salary + withheld
-                wage = min(base, s.lp_wage_cap)
-                lp += wage * s.lp_employer_pct / 100 + wage * s.lp_self_pct / 100  # 自提已含在實領薪水的扣款中
+                if s.lp_monthly_add > 0:
+                    lp += s.lp_monthly_add
+                else:
+                    base = s.lp_wage * gf if s.lp_wage > 0 else net_salary + withheld
+                    wage = min(base, s.lp_wage_cap)
+                    lp += wage * s.lp_employer_pct / 100 + wage * s.lp_self_pct / 100  # 自提已含在實領薪水的扣款中
         if not retired and s.bonus_months > 0 and cal_month == int(s.bonus_month):
             bonus = net_salary * s.bonus_months
             net_salary += bonus
