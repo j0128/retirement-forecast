@@ -11,9 +11,9 @@ import tkinter as tk
 import webbrowser
 from tkinter import filedialog, font as tkfont, messagebox, ttk
 
-from .engine import (Account, ExtraExpense, ExtraIncome, Insurance, Loan, OneOff, Property, Result, Settings,
-                     Stage, from_dict, simulate_scenarios, to_dict)
-from .fmt import money, nice_ticks, short_money
+from .engine import (BUCKET, CASH, Account, ExtraExpense, ExtraIncome, Insurance, Loan, OneOff, Policy, Property,
+                     Result, Settings, Stage, from_dict, simulate_scenarios, to_dict)
+from .fmt import money, nice_ticks, num_str, short_money
 from .report import build_report
 
 # ---------- 配色 ----------
@@ -198,7 +198,7 @@ class FormDialog(tk.Toplevel):
                 var = tk.StringVar(value=default)
                 w = ttk.Combobox(body, textvariable=var, values=rest[0], state="readonly", width=26)
             else:
-                var = tk.StringVar(value=f"{default:g}" if kind == "num" else str(default))
+                var = tk.StringVar(value=num_str(default) if kind == "num" else str(default))
                 w = ttk.Entry(body, textvariable=var, width=28, justify="right" if kind == "num" else "left")
             w.grid(row=r, column=1, pady=5)
             self.vars[key] = var
@@ -237,7 +237,7 @@ class StageEditor(tk.Toplevel):
         self.stages = [Stage(**vars(st)) for st in stages]
         self.result = None
         self.name_var = tk.StringVar(value=name or "")
-        self.cash_var = tk.StringVar(value=f"{cash:,.0f}" if cash is not None else "")
+        self.cash_var = tk.StringVar(value=num_str(cash) if cash is not None else "")
         body = ttk.Frame(self, style="Card.TFrame")
         body.pack(padx=20, pady=(16, 4), fill="both")
         r = 0
@@ -359,7 +359,7 @@ class App(tk.Tk):
     }
 
     NAV = [("basic", "基本資料"), ("income", "收入"), ("expense", "支出"), ("acc", "投資帳戶"),
-           ("loan", "房貸 / 貸款"), ("prop", "不動產"), ("ins", "保險"), ("pen", "退休金 / 勞保"),
+           ("flow", "資金流向"), ("loan", "房貸 / 貸款"), ("prop", "不動產"), ("ins", "保險"), ("pen", "退休金 / 勞保"),
            ("res", "試算結果")]
 
     def __init__(self):
@@ -380,6 +380,8 @@ class App(tk.Tk):
         self._chart = None
         self.pages: dict[str, ScrollFrame] = {}
         self.nav_items: dict = {}
+        self.acct_vars: dict[str, tk.StringVar] = {}
+        self.acct_combos: list = []
         self.current_page = None
         self._build()
         self.bind_all("<MouseWheel>", self._wheel)
@@ -466,26 +468,34 @@ class App(tk.Tk):
             widths=(180, 140, 640), height=12)
         self.acc_tree.column("cash", anchor="e")
         self.acc_tree.column("stages", anchor="w")
+        self._build_flow(self.pages["flow"].inner)
         self.loan_tree = self._list_card(
-            self.pages["loan"].inner, "房貸 / 貸款", ("name", "mode", "pay", "start", "end"),
-            ("名稱", "方式", "每月扣款 / 本金 NT$", "起（YYYY-MM）", "迄（YYYY-MM）"),
+            self.pages["loan"].inner, "房貸 / 貸款", ("name", "mode", "pay", "start", "end", "acct"),
+            ("名稱", "方式", "每月扣款 / 本金 NT$", "起（YYYY-MM）", "迄（YYYY-MM）", "還款帳戶"),
             self.add_loan, self.edit_loan, self.del_loan,
             note="固定月扣款：直接輸入每月金額；本息平均攤還：輸入本金與利率，自動算出每月扣款與餘額。",
-            widths=(180, 220, 180, 150, 150), height=12)
+            widths=(160, 200, 170, 130, 130, 150), height=12)
         self.loan_tree.column("pay", anchor="e")
         self.prop_tree = self._list_card(
-            self.pages["prop"].inner, "不動產", ("name", "value", "g", "sell", "loan"),
-            ("名稱", "目前市值 NT$", "年增值率 %", "出售年齡", "出售時還清貸款"),
+            self.pages["prop"].inner, "不動產", ("name", "value", "buy", "g", "sell", "loan"),
+            ("名稱", "目前市值 NT$", "購入價 NT$", "年增值率 %", "出售年齡", "出售時還清貸款"),
             self.add_prop, self.edit_prop, self.del_prop,
             note="不動產市值計入淨資產；設定出售年齡後，扣除交易成本與綁定貸款的餘額，其餘入帳。不含房地合一稅，可調高交易成本估算。",
-            widths=(200, 170, 130, 130, 200), height=12)
+            widths=(170, 150, 150, 110, 110, 170), height=6)
         self.prop_tree.column("value", anchor="e")
+        self.prop_tree.column("buy", anchor="e")
+        self.sale_tree = self._table_card(
+            self.pages["prop"].inner, "出售試算（依最近一次試算結果）",
+            ("name", "age", "price", "cost", "payoff", "tax", "net", "gain", "gat", "now"),
+            ("名稱", "出售年齡", "預估售價", "交易成本", "償還貸款", "獲利稅", "實拿現金", "獲利（稅前）", "獲利（稅後）", "較目前增值"),
+            "獲利 = 售價 − 交易成本 − 購入價；需填寫購入價才會計算。實拿現金 = 售價 − 交易成本 − 償還貸款 − 獲利稅。", 112, 3)
+        self.sale_tree.insert("", "end", values=("尚未試算", "", "", "", "", "", "", "", "", ""))
         self.ins_tree = self._list_card(
-            self.pages["ins"].inner, "保險", ("name", "premium", "ages", "payout", "to"),
-            ("名稱", "保費 NT$", "繳費年齡", "滿期金 NT$（領取年齡）", "入帳帳戶"),
+            self.pages["ins"].inner, "保險", ("name", "premium", "ages", "payacct", "payout", "to"),
+            ("名稱", "保費 NT$", "繳費年齡", "保費支付帳戶", "滿期金 NT$（領取年齡）", "滿期金入帳帳戶"),
             self.add_ins, self.edit_ins, self.del_ins,
             note="保費列入每月支出；年繳於保單年度起始月扣款。滿期金在領取年齡入帳到指定帳戶。",
-            widths=(200, 180, 150, 220, 160), height=12)
+            widths=(160, 150, 130, 140, 210, 140), height=12)
         self.ins_tree.column("premium", anchor="e")
         self._build_pension(self.pages["pen"].inner)
         self._build_results(self.pages["res"].inner)
@@ -505,6 +515,9 @@ class App(tk.Tk):
             row.configure(bg="#10233D" if active else C["navy2"])
             lab.configure(bg="#10233D" if active else C["navy2"], fg="#FFFFFF" if active else "#DDE6F3")
             bar.configure(bg=C["accent"] if active else C["navy2"])
+        if key == "flow":
+            self._sync_accts()
+            self._refresh_policies()
         self.pages[key].tkraise()
         self.pages[key].to_top()
         if key == "res":
@@ -538,10 +551,20 @@ class App(tk.Tk):
             f.columnconfigure(0, weight=1)
         return left, right
 
-    def _card(self, parent, title, keys=(), hint=None):
+    def _acct_field(self, card, key, label, default=True):
+        """帳戶下拉選單（欄位值存在 Settings 的同名屬性；空白 = 預設）。"""
+        var = tk.StringVar()
+        self.acct_vars[key] = var
+        combo = ttk.Combobox(card, textvariable=var, state="readonly", width=14, values=self._acct_choices(default))
+        self.acct_combos.append((combo, default))
+        card.field(label, None, "", widget=combo)
+
+    def _card(self, parent, title, keys=(), hint=None, extra=None):
         cd = Card(parent, title, self.fonts, hint=hint)
         for k in keys:
             self._money_entry(cd, k)
+        if extra:
+            extra(cd)
         cd.pad()
         cd.grid(sticky="ew", pady=(0, 12), row=parent.grid_size()[1], column=0)
         return cd
@@ -573,17 +596,18 @@ class App(tk.Tk):
         left, right = self._two_cols(cols)
         self._card(left, "固定薪資與稅款準備金",
                    ("salary_net", "salary_withheld", "income_growth", "income_tax_rate", "bonus_months", "bonus_month"),
-                   hint="以「實領月薪」輸入；每月預扣的所得稅視為稅款準備金。")
+                   hint="以「實領月薪」輸入；每月預扣的所得稅視為稅款準備金。",
+                   extra=lambda c: self._acct_field(c, "salary_account", "實領薪水 / 獎金存入帳戶"))
         self._card(right, "稅款準備金如何運作", (),
                    hint="每年 5 月依「年度結算有效稅率」結算上一年度所得稅：課稅所得 = 薪資（實領 + 預扣）+ 年終獎金 + "
                         "應稅的額外收入；已預扣的稅款抵繳，多退少補。\n\n"
                         "年終獎金以實領月薪的月數計算，於指定月份發放並計入課稅所得。退休後不再有薪資。")
         self.extra_tree = self._list_card(
-            p, "額外收入", ("name", "amount", "ages", "g", "tax"),
-            ("名稱", "金額 NT$", "期間（年齡）", "每年成長 %", "是否課稅"),
+            p, "額外收入", ("name", "amount", "ages", "g", "tax", "acct"),
+            ("名稱", "金額 NT$", "期間（年齡）", "每年成長 %", "是否課稅", "存入帳戶"),
             self.add_extra, self.edit_extra, self.del_extra,
             note="薪水以外的收入：兼職、租金、股利、顧問費等；年金額平均分攤到每月，可設定期間與成長率，退休後仍可持續。",
-            widths=(200, 200, 170, 130, 110), height=6)
+            widths=(180, 190, 160, 120, 100, 150), height=6)
         self.extra_tree.column("amount", anchor="e")
 
     def _build_expense(self, p):
@@ -591,16 +615,17 @@ class App(tk.Tk):
         cols = tk.Frame(p, bg=C["bg"])
         cols.pack(fill="x")
         left, right = self._two_cols(cols)
-        self._card(left, "生活支出與通膨", ("monthly_expense", "retire_expense", "inflation"))
+        self._card(left, "生活支出與通膨", ("monthly_expense", "retire_expense", "inflation"),
+                   extra=lambda c: self._acct_field(c, "expense_account", "生活支出 / 醫療費用由哪個帳戶支付"))
         self._card(right, "支出項目說明", (),
                    hint="生活支出以今日幣值輸入，隨通膨逐年上調。\n貸款、保險、醫療費用另於各頁設定；"
                         "子女教育、孝親費、旅遊等有期限的支出請加入「其他固定支出」；買車、出國、遺產等請加入「一次性收支」。")
         self.xexp_tree = self._list_card(
-            p, "其他固定支出", ("name", "amount", "ages", "infl"),
-            ("名稱", "金額 NT$（今日幣值）", "期間（年齡）", "隨通膨調整"),
+            p, "其他固定支出", ("name", "amount", "ages", "infl", "acct"),
+            ("名稱", "金額 NT$（今日幣值）", "期間（年齡）", "隨通膨調整", "支付帳戶"),
             self.add_xexp, self.edit_xexp, self.del_xexp,
             note="子女教育、孝親費、旅遊等：年金額平均分攤到每月，有起訖年齡。",
-            widths=(220, 230, 180, 130), height=5)
+            widths=(190, 210, 170, 120, 150), height=5)
         self.xexp_tree.column("amount", anchor="e")
         self.oneoff_tree = self._list_card(
             p, "一次性收支", ("name", "kind", "amount", "age", "acct"),
@@ -639,6 +664,7 @@ class App(tk.Tk):
                   pady=(2, 2))
         for k in ("li_avg_wage", "li_years_now", "li_claim_age", "li_manual_monthly"):
             self._money_entry(c3, k)
+        self._acct_field(c3, "pension_account", "年金 / 退休金月領存入帳戶")
         c3.pad()
         for c in (0, 1):
             cols.columnconfigure(c, weight=1, uniform="col")
@@ -647,7 +673,7 @@ class App(tk.Tk):
         c3.grid(row=1, column=1, sticky="new", padx=(8, 0), pady=(0, 12))
 
     def _list_card(self, parent, title, cols, heads, add, edit, delete, reorder=None, note="", widths=None,
-                   height=8):
+                   height=8, edit_only=False):
         card = tk.Frame(parent, bg=C["card"], highlightthickness=1, highlightbackground=C["line"])
         card.pack(fill="x", pady=(0, 12))
         bar0 = tk.Frame(card, bg=C["card"])
@@ -665,14 +691,60 @@ class App(tk.Tk):
         tree.pack(fill="x", padx=16, pady=6)
         bar = ttk.Frame(card, style="Card.TFrame")
         bar.pack(fill="x", padx=16, pady=(2, 14))
-        ttk.Button(bar, text="＋ 新增", style="Primary.TButton", command=add).pack(side="left")
-        ttk.Button(bar, text="編輯", command=edit).pack(side="left", padx=6)
-        ttk.Button(bar, text="刪除", command=delete).pack(side="left")
+        if edit_only:
+            ttk.Button(bar, text="編輯規則", style="Primary.TButton", command=edit).pack(side="left")
+        else:
+            ttk.Button(bar, text="＋ 新增", style="Primary.TButton", command=add).pack(side="left")
+            ttk.Button(bar, text="編輯", command=edit).pack(side="left", padx=6)
+            ttk.Button(bar, text="刪除", command=delete).pack(side="left")
         if reorder:
             ttk.Button(bar, text="▲ 上移", command=lambda: reorder(-1)).pack(side="left", padx=(24, 6))
             ttk.Button(bar, text="▼ 下移", command=lambda: reorder(1)).pack(side="left")
         tree.bind("<Double-1>", lambda e: edit())
         return tree
+
+    def _table_card(self, parent, title, cols, heads, note="", width=110, height=4):
+        card = tk.Frame(parent, bg=C["card"], highlightthickness=1, highlightbackground=C["line"])
+        card.pack(fill="x", pady=(0, 12))
+        bar0 = tk.Frame(card, bg=C["card"])
+        bar0.pack(fill="x", padx=16, pady=(12, 2))
+        tk.Frame(bar0, bg=C["accent"], width=4, height=16).pack(side="left", padx=(0, 8))
+        tk.Label(bar0, text=title, bg=C["card"], fg=C["navy"], font=self.fonts["h2"]).pack(side="left")
+        if note:
+            ttk.Label(card, text=note, style="Muted.TLabel", wraplength=900, justify="left").pack(
+                anchor="w", padx=16, pady=(0, 4))
+        wrap = tk.Frame(card, bg=C["card"])
+        wrap.pack(fill="x", padx=16, pady=(4, 14))
+        tree = ttk.Treeview(wrap, columns=cols, show="headings", height=min(height, 6), selectmode="none")
+        xs = ttk.Scrollbar(wrap, orient="horizontal", command=tree.xview)
+        tree.configure(xscrollcommand=xs.set)
+        for c, h in zip(cols, heads):
+            tree.heading(c, text=h)
+            tree.column(c, width=width, anchor="e" if c not in ("name", "age") else "center", stretch=False)
+        tree.pack(fill="x")
+        xs.pack(fill="x")
+        tree.tag_configure("odd", background=C["stripe"])
+        return tree
+
+    def _build_flow(self, p):
+        self._page_title(p, "資金流向", "收入存入哪個帳戶、支出由哪個帳戶支付，以及帳戶的「上限」與「固定額度」規則")
+        card = tk.Frame(p, bg=C["card"], highlightthickness=1, highlightbackground=C["line"])
+        card.pack(fill="x", pady=(0, 12))
+        bar0 = tk.Frame(card, bg=C["card"])
+        bar0.pack(fill="x", padx=16, pady=(12, 2))
+        tk.Frame(bar0, bg=C["accent"], width=4, height=16).pack(side="left", padx=(0, 8))
+        tk.Label(bar0, text="資金流向總覽", bg=C["card"], fg=C["navy"], font=self.fonts["h2"]).pack(side="left")
+        self.flow_label = tk.Label(card, text="", bg=C["card"], fg=C["text"], justify="left", anchor="w",
+                                   font=self.fonts["base"], wraplength=980)
+        self.flow_label.pack(fill="x", padx=18, pady=(4, 14))
+        self.policy_tree = self._list_card(
+            p, "帳戶規則（上限 / 固定額度）", ("acct", "rule", "amt", "over", "src"),
+            ("帳戶", "規則", "金額 NT$", "超出部分流向", "不足時補足來源"),
+            None, self.edit_policy, None, edit_only=True,
+            note="「上限」：帳戶超過上限時，多出的錢每月自動轉到指定帳戶（例如活存超過 100 萬就轉去投資）。"
+                 "「固定額度」：每年 1 月把帳戶調整到固定金額，不足由來源補、超出轉出。雙擊或按「編輯」設定。",
+            widths=(170, 220, 150, 190, 230), height=7)
+        self.policy_tree.column("amt", anchor="e")
 
     def _build_results(self, p):
         self._page_title(p, "試算結果", "基準情境的關鍵指標、三情境比較與逐年明細")
@@ -776,6 +848,8 @@ class App(tk.Tk):
                 v.set(f"{val:,.0f}")
             else:
                 v.set(f"{val:g}" if isinstance(val, float) else str(val))
+        for key, v in self.acct_vars.items():
+            v.set(self._acct_label(getattr(s, key), self._acct_choices(True), True))
         self._refresh_lists()
 
     def _from_form(self) -> Settings:
@@ -791,9 +865,14 @@ class App(tk.Tk):
                     setattr(s, key, float(raw or 0))
                 except ValueError:
                     raise ValueError(f"「{self.F.get(key, (key,))[0]}」不是有效數字：{raw}")
+        for key, v in self.acct_vars.items():
+            setattr(s, key, self._acct_store(v.get()))
         return s
 
     def _refresh_lists(self):
+        for combo, default in self.acct_combos:
+            combo["values"] = self._acct_choices(default)
+        self._refresh_policies()
         self.acc_tree.delete(*self.acc_tree.get_children())
         for i, a in enumerate(self.s.accounts):
             self.acc_tree.insert("", "end", values=(a.name, money(a.cash), "    " + stage_summary(a.stages)),
@@ -805,33 +884,35 @@ class App(tk.Tk):
             else:
                 mode, amt = "固定月扣款", money(l.monthly_payment)
             end = l.end or f"(+{l.years:g} 年)"
-            self.loan_tree.insert("", "end", values=(l.name, mode, amt, l.start, end),
+            self.loan_tree.insert("", "end", values=(l.name, mode, amt, l.start, end, l.pay_account or "預設"),
                                   tags=("odd" if i % 2 else "even",))
 
         self.prop_tree.delete(*self.prop_tree.get_children())
         for i, x in enumerate(self.s.properties):
             sell = f"{x.sell_age:g} 歲" if x.sell_age > 0 else "不出售"
             self.prop_tree.insert("", "end", tags=("odd" if i % 2 else "even",),
-                                  values=(x.name, money(x.value), f"{x.appreciation:g}", sell, x.loan_name or "—"))
+                                  values=(x.name, money(x.value), money(x.purchase_price) if x.purchase_price else "—",
+                                          f"{x.appreciation:g}", sell, x.loan_name or "—"))
         self.ins_tree.delete(*self.ins_tree.get_children())
         for i, x in enumerate(self.s.insurances):
             pay = f"{money(x.premium)} / {'年' if x.freq == 'year' else '月'}"
             out = f"{money(x.payout)}（{(x.payout_age or x.end_age):g} 歲）" if x.payout > 0 else "—"
             self.ins_tree.insert("", "end", tags=("odd" if i % 2 else "even",),
-                                 values=(x.name, pay, f"{x.start_age:g}–{x.end_age:g} 歲", out, x.payout_to or "活存"))
+                                 values=(x.name, pay, f"{x.start_age:g}–{x.end_age:g} 歲", x.pay_account or "預設", out,
+                                         x.payout_to or "活存"))
         self.extra_tree.delete(*self.extra_tree.get_children())
         for i, x in enumerate(self.s.extra_incomes):
             amt = f"{money(x.amount)} / {'年' if x.freq == 'year' else '月'}"
             self.extra_tree.insert("", "end", tags=("odd" if i % 2 else "even",),
                                    values=(x.name, amt, f"{x.start_age:g}–{x.end_age:g} 歲", f"{x.growth:g}",
-                                           "是" if x.taxable else "否"))
+                                           "是" if x.taxable else "否", x.account or "預設"))
 
         self.xexp_tree.delete(*self.xexp_tree.get_children())
         for i, x in enumerate(self.s.extra_expenses):
             amt = f"{money(x.amount)} / {'年' if x.freq == 'year' else '月'}"
             self.xexp_tree.insert("", "end", tags=("odd" if i % 2 else "even",),
                                   values=(x.name, amt, f"{x.start_age:g}–{x.end_age:g} 歲",
-                                          "是" if x.inflation_adjust else "否"))
+                                          "是" if x.inflation_adjust else "否", x.pay_account or "預設"))
         self.oneoff_tree.delete(*self.oneoff_tree.get_children())
         for i, x in enumerate(self.s.one_offs):
             self.oneoff_tree.insert("", "end", tags=("odd" if i % 2 else "even",),
@@ -888,6 +969,7 @@ class App(tk.Tk):
     def _loan_dialog(self, l: Loan | None):
         l = l or Loan(start=dt.date.today().strftime("%Y-%m"))
         names = ["固定月扣款", "本息平均攤還（輸入本金與利率）"]
+        ch = self._acct_choices(True)
         d = FormDialog(self, "房貸/貸款", [
             ("name", "名稱", "text", l.name),
             ("mode", "計算方式", "choice", names[1] if l.mode == "amort" else names[0], names),
@@ -896,11 +978,13 @@ class App(tk.Tk):
             ("annual_rate", "年利率 %（攤還用）", "num", l.annual_rate),
             ("start", "起始年月 YYYY-MM", "text", l.start),
             ("end", "結束年月 YYYY-MM（含）", "text", l.end),
-            ("years", "或貸款年限（結束年月留空時，攤還用）", "num", l.years)])
+            ("years", "或貸款年限（結束年月留空時，攤還用）", "num", l.years),
+            ("pay_account", "還款由哪個帳戶支付", "choice", self._acct_label(l.pay_account, ch, True), ch)])
         if not d.result:
             return None
         r = d.result
         r["mode"] = "amort" if r["mode"] == names[1] else "fixed"
+        r["pay_account"] = self._acct_store(r["pay_account"])
         return Loan(**r)
 
     def add_loan(self):
@@ -924,7 +1008,7 @@ class App(tk.Tk):
             self._refresh_lists()
 
     NONE = "（無）"
-    CASH = "（活存）"
+    DEFAULT = "（預設）"
 
     def add_prop(self):
         self._crud(self.prop_tree, self.s.properties, self._prop_dialog, Property)[0]()
@@ -983,9 +1067,18 @@ class App(tk.Tk):
     def del_extra(self):
         self._crud(self.extra_tree, self.s.extra_incomes, self._extra_dialog, self._new_extra)[2]()
 
-    def _acct_choices(self):
+    def _acct_choices(self, default=False):
+        """可選帳戶：活存、生活費帳戶、各投資帳戶、退休金帳戶（存在時）。default=True 時最前面加「（預設）」。"""
         extra = ["退休金帳戶"] if (self.s.lp_enabled and self.s.lp_lump_sum) or self.s.employer_lump > 0 else []
-        return [self.CASH] + [a.name for a in self.s.accounts] + extra
+        return ([self.DEFAULT] if default else []) + [CASH, BUCKET] + [a.name for a in self.s.accounts] + extra
+
+    def _acct_label(self, stored, choices, default=False):
+        if stored and stored in choices:
+            return stored
+        return self.DEFAULT if default else CASH
+
+    def _acct_store(self, label):
+        return "" if label == self.DEFAULT else label
 
     def _crud(self, tree, items, dialog, new):
         """回傳 (add, edit, delete)。"""
@@ -1011,16 +1104,19 @@ class App(tk.Tk):
         return add, edit, delete
 
     def _xexp_dialog(self, x: ExtraExpense):
+        ch = self._acct_choices(True)
         d = FormDialog(self, "其他固定支出", [
             ("name", "名稱", "text", x.name), ("amount", "金額 NT$（今日幣值）", "num", x.amount),
             ("freq", "金額單位", "choice", "每年" if x.freq == "year" else "每月", ["每月", "每年"]),
-            ("start_age", "起始年齡", "num", x.start_age), ("end_age", "結束年齡（不含）", "num", x.end_age),
-            ("inflation_adjust", "隨通膨調整", "choice", "是" if x.inflation_adjust else "否", ["是", "否"])])
+            ("start_age", "起始年齡", "num", x.start_age), ("end_age", "結束年齡（到該歲生日前為止）", "num", x.end_age),
+            ("inflation_adjust", "隨通膨調整", "choice", "是" if x.inflation_adjust else "否", ["是", "否"]),
+            ("pay_account", "由哪個帳戶支付", "choice", self._acct_label(x.pay_account, ch, True), ch)])
         if not d.result:
             return None
         r = d.result
         r["freq"] = "year" if r["freq"] == "每年" else "month"
         r["inflation_adjust"] = r["inflation_adjust"] == "是"
+        r["pay_account"] = self._acct_store(r["pay_account"])
         return ExtraExpense(**r)
 
     def _oneoff_dialog(self, x: OneOff):
@@ -1029,44 +1125,48 @@ class App(tk.Tk):
             ("name", "名稱", "text", x.name),
             ("kind", "類型", "choice", "收入" if x.kind == "in" else "支出", ["支出", "收入"]),
             ("amount", "金額 NT$（名目）", "num", x.amount), ("age", "發生年齡", "num", x.age),
-            ("account", "收入入帳帳戶", "choice", x.account if x.account in choices else self.CASH, choices)])
+            ("account", "收入入帳帳戶（支出走「支出帳戶」）", "choice", self._acct_label(x.account, choices), choices)])
         if not d.result:
             return None
         r = d.result
         r["kind"] = "in" if r["kind"] == "收入" else "out"
-        r["account"] = "" if r["account"] == self.CASH else r["account"]
         return OneOff(**r)
 
     def _extra_dialog(self, x: ExtraIncome):
+        ch = self._acct_choices(True)
         d = FormDialog(self, "額外收入", [
             ("name", "名稱", "text", x.name), ("amount", "金額 NT$", "num", x.amount),
             ("freq", "金額單位", "choice", "每年" if x.freq == "year" else "每月", ["每月", "每年"]),
-            ("start_age", "起始年齡", "num", x.start_age), ("end_age", "結束年齡（不含）", "num", x.end_age),
+            ("start_age", "起始年齡", "num", x.start_age), ("end_age", "結束年齡（到該歲生日前為止）", "num", x.end_age),
             ("growth", "每年成長 %", "num", x.growth),
-            ("taxable", "是否計入所得稅", "choice", "是" if x.taxable else "否", ["是", "否"])])
+            ("taxable", "是否計入所得稅", "choice", "是" if x.taxable else "否", ["是", "否"]),
+            ("account", "收入存入哪個帳戶", "choice", self._acct_label(x.account, ch, True), ch)])
         if not d.result:
             return None
         r = d.result
         r["freq"] = "year" if r["freq"] == "每年" else "month"
         r["taxable"] = r["taxable"] == "是"
+        r["account"] = self._acct_store(r["account"])
         return ExtraIncome(**r)
 
     def _ins_dialog(self, x: Insurance):
         choices = self._acct_choices()
+        ch = self._acct_choices(True)
         d = FormDialog(self, "保險", [
             ("name", "名稱", "text", x.name), ("premium", "保費 NT$", "num", x.premium),
             ("freq", "繳費方式", "choice", "每年" if x.freq == "year" else "每月", ["每月", "每年"]),
-            ("start_age", "繳費起始年齡", "num", x.start_age), ("end_age", "繳費結束年齡（不含）", "num", x.end_age),
+            ("start_age", "繳費起始年齡", "num", x.start_age), ("end_age", "繳費結束年齡（到該歲生日前為止）", "num", x.end_age),
             ("inflation_adjust", "保費隨通膨調整", "choice", "是" if x.inflation_adjust else "否", ["否", "是"]),
+            ("pay_account", "保費由哪個帳戶支付", "choice", self._acct_label(x.pay_account, ch, True), ch),
             ("payout", "滿期金 / 理賠金 NT$（0 = 無）", "num", x.payout),
             ("payout_age", "領取年齡（0 = 繳費結束時）", "num", x.payout_age),
-            ("payout_to", "入帳帳戶", "choice", x.payout_to if x.payout_to in choices else self.CASH, choices)])
+            ("payout_to", "滿期金入帳帳戶", "choice", self._acct_label(x.payout_to, choices), choices)])
         if not d.result:
             return None
         r = d.result
         r["freq"] = "year" if r["freq"] == "每年" else "month"
         r["inflation_adjust"] = r["inflation_adjust"] == "是"
-        r["payout_to"] = "" if r["payout_to"] == self.CASH else r["payout_to"]
+        r["pay_account"] = self._acct_store(r["pay_account"])
         return Insurance(**r)
 
     def _prop_dialog(self, x: Property):
@@ -1074,17 +1174,131 @@ class App(tk.Tk):
         loans = [self.NONE] + [l.name for l in self.s.loans]
         d = FormDialog(self, "不動產", [
             ("name", "名稱", "text", x.name), ("value", "目前市值 NT$", "num", x.value),
+            ("purchase_price", "購入價 NT$（0 = 不計算獲利）", "num", x.purchase_price),
             ("appreciation", "年增值率 %", "num", x.appreciation),
             ("sell_age", "出售年齡（0 = 不出售）", "num", x.sell_age),
             ("sell_cost", "交易成本 %（仲介、稅費）", "num", x.sell_cost),
+            ("sell_tax_rate", "出售獲利稅率 %（如房地合一稅）", "num", x.sell_tax_rate),
             ("loan_name", "出售時一併還清的貸款", "choice", x.loan_name if x.loan_name in loans else self.NONE, loans),
-            ("proceeds_to", "售屋款入帳帳戶", "choice", x.proceeds_to if x.proceeds_to in accts else self.CASH, accts)])
+            ("proceeds_to", "售屋款入帳帳戶", "choice", self._acct_label(x.proceeds_to, accts), accts)])
         if not d.result:
             return None
         r = d.result
         r["loan_name"] = "" if r["loan_name"] == self.NONE else r["loan_name"]
-        r["proceeds_to"] = "" if r["proceeds_to"] == self.CASH else r["proceeds_to"]
         return Property(**r)
+
+    # ---------- 帳戶規則 / 資金流向 ----------
+    MODE_LABELS = {"none": "無規則", "cap": "上限（超過轉出）", "fixed": "固定額度（每年 1 月）"}
+
+    def _sync_accts(self):
+        for key, v in self.acct_vars.items():
+            setattr(self.s, key, self._acct_store(v.get()))
+
+    def _policy_of(self, name):
+        return next((p_ for p_ in self.s.policies if p_.account == name), None)
+
+    def _refresh_policies(self):
+        if not hasattr(self, "policy_tree"):
+            return
+        tree = self.policy_tree
+        tree.delete(*tree.get_children())
+        for i, name in enumerate(self._acct_choices()):
+            p_ = self._policy_of(name)
+            if name == BUCKET:
+                rule, amt = "固定額度（退休後每年年初）", f"{money(self.s.bucket_amount)}（今日幣值）"
+                over = (p_.overflow_to if p_ and p_.overflow_to else "不轉出")
+                src = (p_.refill_from if p_ and p_.refill_from else "依投資帳戶清單順序")
+            elif p_ and p_.mode != "none":
+                rule, amt = self.MODE_LABELS[p_.mode], money(p_.limit)
+                over = p_.overflow_to or "不轉出"
+                src = (p_.refill_from or "依投資帳戶清單順序") if p_.mode == "fixed" else "—"
+            else:
+                rule, amt, over, src = "無規則", "—", "—", "—"
+            tree.insert("", "end", values=(name, rule, amt, over, src), tags=("odd" if i % 2 else "even",))
+        self._refresh_flow_text()
+
+    def _refresh_flow_text(self):
+        if not hasattr(self, "flow_label"):
+            return
+        s = self.s
+        dflt = "預設（退休前＝活存，退休後＝生活費帳戶）"
+        lines = ["【收入存入】",
+                 f"  • 實領薪水 / 年終獎金 → {s.salary_account or dflt}"]
+        lines += [f"  • 額外收入「{x.name}」 → {x.account or dflt}" for x in s.extra_incomes]
+        lines += [f"  • 勞保年金 / 退休金月領 → {s.pension_account or dflt}", "", "【支出由哪個帳戶支付】",
+                  f"  • 生活支出、醫療費用、一次性支出 ← {s.expense_account or dflt}"]
+        lines += [f"  • 貸款「{x.name}」 ← {x.pay_account or dflt}" for x in s.loans]
+        lines += [f"  • 保險「{x.name}」 ← {x.pay_account or dflt}" for x in s.insurances]
+        lines += [f"  • 其他固定支出「{x.name}」 ← {x.pay_account or dflt}" for x in s.extra_expenses]
+        lines += ["  • 每月投資加碼 ← 預設現金流（退休前＝活存）", "",
+                  "【不足時怎麼辦】指定帳戶餘額不夠時，缺口併入「預設帳戶」；預設帳戶也不夠時，依序動用："
+                  "投資帳戶（依清單順序）→ 退休金帳戶 → 活存；全部耗盡才算資產耗盡。"]
+        rules = []
+        for p_ in s.policies:
+            if p_.account == BUCKET:
+                continue
+            if p_.mode == "cap" and p_.overflow_to:
+                rules.append(f"  • 「{p_.account}」超過 {money(p_.limit)} 的部分 → 轉入「{p_.overflow_to}」")
+            elif p_.mode == "fixed":
+                rules.append(f"  • 「{p_.account}」每年 1 月調整為 {money(p_.limit)}"
+                             f"（不足由「{p_.refill_from or '投資帳戶依序'}」補，超出轉入「{p_.overflow_to or '不轉出'}」）")
+        bp = self._policy_of(BUCKET)
+        rules.append(f"  • 「生活費帳戶」退休後每年年初補足到 {money(s.bucket_amount)}（今日幣值）"
+                     f"，來源：{(bp.refill_from if bp and bp.refill_from else '投資帳戶依序')}"
+                     f"，超出：{(bp.overflow_to if bp and bp.overflow_to else '不轉出')}")
+        lines += ["", "【帳戶規則】"] + rules
+        self.flow_label.config(text="\n".join(lines))
+
+    def edit_policy(self):
+        sel = self.policy_tree.selection()
+        if not sel:
+            return
+        name = self.policy_tree.item(sel[0], "values")[0]
+        p_ = self._policy_of(name) or Policy(account=name)
+        others = [c for c in self._acct_choices() if c != name]
+        none_over, none_src = "（不轉出）", "（依投資帳戶清單順序）"
+        over_ch, src_ch = [none_over] + others, [none_src] + others
+        over = p_.overflow_to if p_.overflow_to in others else none_over
+        src = p_.refill_from if p_.refill_from in others else none_src
+        if name == BUCKET:
+            fields = [("limit", "每年年初補足金額 NT$（今日幣值）", "num", self.s.bucket_amount),
+                      ("refill_from", "不足時由哪個帳戶補足", "choice", src, src_ch),
+                      ("overflow_to", "超出部分流向", "choice", over, over_ch)]
+        else:
+            labels = list(self.MODE_LABELS.values())
+            fields = [("mode", "規則", "choice", self.MODE_LABELS[p_.mode], labels),
+                      ("limit", "上限 / 固定額度 NT$", "num", p_.limit),
+                      ("overflow_to", "超出部分流向（上限 / 固定額度共用）", "choice", over, over_ch),
+                      ("refill_from", "固定額度不足時的補足來源", "choice", src, src_ch)]
+        d = FormDialog(self, f"帳戶規則：{name}", fields)
+        if not d.result:
+            return
+        r = d.result
+        new = Policy(account=name, mode="fixed" if name == BUCKET else "none", limit=0.0)
+        if name != BUCKET:
+            new.mode = next(k for k, v in self.MODE_LABELS.items() if v == r["mode"])
+            new.limit = r["limit"]
+        else:
+            self.s.bucket_amount = r["limit"]
+            self.vars["bucket_amount"].set(f"{r['limit']:,.0f}")
+        new.overflow_to = "" if r["overflow_to"] == none_over else r["overflow_to"]
+        new.refill_from = "" if r["refill_from"] == none_src else r["refill_from"]
+        self.s.policies = [x for x in self.s.policies if x.account != name]
+        if name == BUCKET or new.mode != "none":
+            self.s.policies.append(new)
+        self._refresh_policies()
+
+    def _fill_sales(self, r: Result):
+        tree = self.sale_tree
+        tree.delete(*tree.get_children())
+        for i, x in enumerate(r.property_sales):
+            g = x["gain"]
+            tree.insert("", "end", tags=("odd" if i % 2 else "even",), values=(
+                x["name"], f"{x['age']:g} 歲", money(x["price"]), money(x["cost"]), money(x["payoff"]),
+                money(x["tax"]), money(x["net_cash"]), money(g) if g is not None else "（未填購入價）",
+                money(x["gain_after_tax"]) if g is not None else "—", money(x["gain_vs_now"])))
+        if not r.property_sales:
+            tree.insert("", "end", values=("無出售資料", "", "", "", "", "", "", "", "", ""))
 
     # ---------- 計算與顯示 ----------
     def calculate(self):
@@ -1169,6 +1383,7 @@ class App(tk.Tk):
         d = s.scenario_delta
         self.sc_note.config(text=f"悲觀 / 樂觀：投資帳戶（含退休金帳戶）報酬率 ∓ {d:g} 個百分點；淨資產含不動產。")
         self._fill_table()
+        self._fill_sales(r)
         self._draw_chart()
 
     def _fill_table(self):

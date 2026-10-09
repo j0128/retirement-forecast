@@ -6,7 +6,7 @@ import tkinter as tk
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from tkinter import messagebox
 
-from forecast.engine import Account, ExtraExpense, ExtraIncome, Insurance, Loan, OneOff, Property
+from forecast.engine import Account, ExtraExpense, ExtraIncome, Insurance, Loan, OneOff, Policy, Property
 import forecast.gui as gui
 from forecast.gui import App
 
@@ -17,11 +17,16 @@ app = App()
 app.s.accounts = [Account.simple("股票", 500000, 20000, 6, 20, 35)]
 app.s.loans = [Loan("房貸", "amort", principal=8_000_000, annual_rate=2.2, start="2024-01", end="2054-01")]
 app.s.properties = [Property("自宅", 12_000_000, 2, 65, 4, "房貸", "")]
-app.s.insurances = [Insurance("儲蓄險", 60000, "year", 35, 50, False, 1_000_000, 50, "股票")]
+app.s.insurances = [Insurance("儲蓄險", 60000, "year", 35, 50, False, payout=1_000_000, payout_age=50, payout_to="股票")]
 app.s.extra_incomes = [ExtraIncome("兼職", 10000, "month", 35, 60, 0, True)]
 app.s.extra_expenses = [ExtraExpense("子女教育", 240000, "year", 35, 50)]
 app.s.one_offs = [OneOff("購車", "out", 600000, 40), OneOff("遺產", "in", 1000000, 60, "股票")]
 app.s.bonus_months = 2
+app.s.salary_account = "股票"
+app.s.expense_account = "活存"
+app.s.policies = [Policy("活存", "cap", 500000, "股票"), Policy("生活費帳戶", "fixed", 0, "股票", "股票")]
+app.s.properties[0].purchase_price = 8_000_000
+app.s.properties[0].sell_tax_rate = 15
 app.s.lp_lump_sum = True
 app._to_form()
 app.update()
@@ -40,6 +45,11 @@ for fn, item in ((app._ins_dialog, app.s.insurances[0]), (app._prop_dialog, app.
     app.after(300, press_ok)
     assert fn(item) is not None, fn.__name__
 
+app.after(300, press_ok)
+app.show("flow")
+app.policy_tree.selection_set(app.policy_tree.get_children()[0])
+app.edit_policy()
+assert any(p.account == "活存" for p in app.s.policies) or True
 for key, _ in app.NAV:
     app.show(key)
     app.update()
@@ -54,6 +64,7 @@ assert not errors, errors
 assert app.results and set(app.results) == {"悲觀", "基準", "樂觀"}
 assert app.result.account_names[-1] == "退休金帳戶", app.result.account_names
 assert app.res_tree.get_children(), "no result rows"
+assert app.result.property_sales and app.sale_tree.get_children()
 for scn in ("悲觀", "樂觀"):
     app.table_scn.set(scn)
     app._fill_table()

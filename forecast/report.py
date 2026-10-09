@@ -100,6 +100,17 @@ def build_report(s: Settings, results: dict) -> str:
         ("醫療費用", f"{s.medical_start_age:g} 歲起每月 NT$ {money(s.medical_monthly)}（今日幣值），每年多成長 {s.medical_growth:g}%"),
         ("情境", f"悲觀 / 樂觀 = 投資報酬率 ∓ {s.scenario_delta:g} 個百分點"),
     ]
+    dflt = "預設（退休前活存、退休後生活費帳戶）"
+    assume.insert(1, ("資金流向", f"薪水存入 {s.salary_account or dflt}；生活支出/醫療由 {s.expense_account or dflt} 支付；"
+                                f"年金存入 {s.pension_account or dflt}"))
+    rules = []
+    for p_ in s.policies:
+        if p_.account != "生活費帳戶" and p_.mode == "cap" and p_.overflow_to:
+            rules.append(f"{p_.account} 上限 {money(p_.limit)} → 超出轉入 {p_.overflow_to}")
+        elif p_.account != "生活費帳戶" and p_.mode == "fixed":
+            rules.append(f"{p_.account} 每年 1 月固定 {money(p_.limit)}")
+    if rules:
+        assume.insert(2, ("帳戶規則", "；".join(rules)))
     assume_html = "".join(f"<tr><th>{e(a)}</th><td>{e(b)}</td></tr>" for a, b in assume)
     heads = ["年齡", "實領薪水", "額外收入", "年金/退休金月領", "生活+其他支出", "保險", "醫療", "貸款",
              "不動產", "淨資產（不含不動產）", "淨資產", "今日購買力"]
@@ -111,6 +122,19 @@ def build_report(s: Settings, results: dict) -> str:
                  money(x.property_value), money(x.liquid_net_worth), money(x.net_worth), money(x.real_net_worth)]
         body += f"<tr{cls}>" + "".join(f"<td class='r'>{c}</td>" for c in cells) + "</tr>"
     head_html = "".join(f"<th>{h}</th>" for h in heads)
+    sales = base.property_sales
+    sales_html = ""
+    if sales:
+        srows = "".join(
+            f"<tr><td>{e(x['name'])}</td><td class='r'>{x['age']:g} 歲</td><td class='r'>{money(x['price'])}</td>"
+            f"<td class='r'>{money(x['cost'])}</td><td class='r'>{money(x['payoff'])}</td>"
+            f"<td class='r'>{money(x['tax'])}</td><td class='r'>{money(x['net_cash'])}</td>"
+            f"<td class='r'>{money(x['gain']) if x['gain'] is not None else '—'}</td>"
+            f"<td class='r'>{money(x['gain_after_tax']) if x['gain_after_tax'] is not None else '—'}</td></tr>"
+            for x in sales)
+        sales_html = ("<h2>不動產出售試算</h2><div class='card'><table><thead><tr><th>名稱</th><th>出售年齡</th>"
+                      "<th>預估售價</th><th>交易成本</th><th>償還貸款</th><th>獲利稅</th><th>實拿現金</th>"
+                      f"<th>獲利（稅前）</th><th>獲利（稅後）</th></tr></thead><tbody>{srows}</tbody></table></div>")
     warn = "".join(f"<li>{e(w)}</li>" for w in base.warnings)
     return f"""<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8"><title>退休收益預測報告</title>
 <style>
@@ -137,7 +161,7 @@ td.r{{text-align:right}} tr.ret td{{background:#fff4d6}}
 <h2>淨資產走勢（含不動產，名目金額）</h2><div class="card">{_svg_chart(results, s.retire_age)}</div>
 <h2>情境比較</h2><div class="card"><table><thead><tr><th>情境</th><th>退休時淨資產</th><th>壽命時淨資產</th>
 <th>壽命時（不含不動產）</th><th>資產耗盡</th></tr></thead><tbody>{sc_rows}</tbody></table></div>
-<h2>主要假設</h2><div class="card"><table class="assume">{assume_html}</table></div>
+{sales_html}<h2>主要假設</h2><div class="card"><table class="assume">{assume_html}</table></div>
 {f'<h2>提醒</h2><div class="card"><ul>{warn}</ul></div>' if warn else ''}
 <h2>逐年明細（基準情境）</h2><div class="card"><table><thead><tr>{head_html}</tr></thead><tbody>{body}</tbody></table></div>
 <p class="note">本報告為依輸入假設之估算，非投資、稅務或保險建議。所得稅以有效稅率簡化；不動產出售不含房地合一稅；

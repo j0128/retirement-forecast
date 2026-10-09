@@ -29,3 +29,9 @@ def nice_ticks(lo: float, hi: float, n: int = 5) -> list:
         out.append(v)
         v += step
     return out
+
+
+def num_str(v: float) -> str:
+    """輸入框用的數字字串：不使用科學記號，避免大數字被截成 6 位有效數字。"""
+    v = float(v)
+    return str(int(v)) if v == int(v) else f"{v:.10g}"

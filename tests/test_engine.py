@@ -5,11 +5,13 @@ import sys
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from forecast.engine import (Account, ExtraExpense, ExtraIncome, OneOff, Insurance, Loan, Property, Settings, Stage,
+from forecast.engine import (Account, ExtraExpense, ExtraIncome, OneOff, Policy, Insurance, Loan, Property, Settings, Stage,
                              simulate_scenarios, stage_at, annuity_payment, from_dict,
                              labor_insurance_monthly, simulate, to_dict, parse_ym)
 
 TODAY = dt.date(2026, 1, 15)
+CASH_NAME = "活存"
+BUCKET_NAME = "生活費帳戶"
 
 
 def base(**kw):
@@ -264,11 +266,103 @@ class EngineTests(unittest.TestCase):
         s = base(extra_expenses=[ExtraExpense()], one_offs=[OneOff()])
         self.assertEqual(to_dict(s), to_dict(from_dict(to_dict(s))))
 
+    def acct(self, name="a", cash=0.0):
+        return Account(name, cash, [Stage(0, 120, 0, 0)])
+
+    def test_salary_deposited_to_named_account(self):
+        s = base(current_age=30, retire_age=31, life_expectancy=32, salary_net=10_000, salary_account="a",
+                 accounts=[self.acct()])
+        r = simulate(s, TODAY)
+        self.assertAlmostEqual(r.rows[0].account_balances[0], 120_000, delta=1)
+        self.assertAlmostEqual(r.rows[0].free_cash, 0, delta=1)
+
+    def test_extra_income_and_pension_accounts(self):
+        s = base(current_age=65, retire_age=65, life_expectancy=66, li_enabled=True, li_manual_monthly=10_000,
+                 pension_account="a", accounts=[self.acct()], bucket_amount=0,
+                 extra_incomes=[ExtraIncome("租", 5_000, "month", 65, 70, 0, False, "b")])
+        s.accounts.append(self.acct("b"))
+        r = simulate(s, TODAY)
+        self.assertAlmostEqual(r.rows[0].account_balances[0], 120_000, delta=1)
+        self.assertAlmostEqual(r.rows[0].account_balances[1], 60_000, delta=1)
+
+    def test_expense_paid_from_named_account_with_fallback(self):
+        s = base(current_age=30, retire_age=40, life_expectancy=41, monthly_expense=10_000, savings_cash=1_000_000,
+                 expense_account="a", accounts=[self.acct("a", 50_000)])
+        r = simulate(s, TODAY)
+        self.assertAlmostEqual(r.rows[0].account_balances[0], 0, delta=1)      # 指定帳戶先用完
+        self.assertAlmostEqual(r.rows[0].free_cash, 1_000_000 - (120_000 - 50_000), delta=1)  # 不足由活存補
+
+    def test_item_pay_accounts(self):
+        loan = Loan("車貸", "fixed", monthly_payment=1_000, start="2026-01", end="2026-12", pay_account="a")
+        ins = Insurance("險", 500, "month", 30, 31, pay_account="b")
+        xe = ExtraExpense("教育", 2_000, "month", 30, 31, False, "c")
+        s = base(current_age=30, retire_age=40, life_expectancy=41, savings_cash=1_000_000, loans=[loan],
+                 insurances=[ins], extra_expenses=[xe],
+                 accounts=[self.acct("a", 100_000), self.acct("b", 100_000), self.acct("c", 100_000)])
+        r = simulate(s, TODAY)
+        self.assertAlmostEqual(r.rows[0].account_balances[0], 100_000 - 12_000, delta=1)
+        self.assertAlmostEqual(r.rows[0].account_balances[1], 100_000 - 6_000, delta=1)
+        self.assertAlmostEqual(r.rows[0].account_balances[2], 100_000 - 24_000, delta=1)
+        self.assertAlmostEqual(r.rows[0].free_cash, 1_000_000, delta=1)
+
+    def test_cap_policy_sweeps_excess_cash(self):
+        s = base(current_age=30, retire_age=40, life_expectancy=41, salary_net=50_000, accounts=[self.acct()],
+                 policies=[Policy(CASH_NAME, "cap", 100_000, "a")])
+        r = simulate(s, TODAY)
+        self.assertAlmostEqual(r.rows[0].free_cash, 100_000, delta=1)
+        self.assertAlmostEqual(r.rows[0].account_balances[0], 600_000 - 100_000, delta=1)
+
+    def test_cap_policy_without_valid_target_is_ignored(self):
+        s = base(current_age=30, retire_age=40, life_expectancy=41, salary_net=50_000,
+                 policies=[Policy(CASH_NAME, "cap", 100_000, "不存在")])
+        self.assertAlmostEqual(simulate(s, TODAY).rows[0].free_cash, 600_000, delta=1)
+
+    def test_fixed_policy_tops_up_and_overflows(self):
+        s = base(current_age=30, retire_age=32, life_expectancy=33, savings_cash=1_000_000,
+                 accounts=[self.acct("a", 0), self.acct("b", 500_000)],
+                 policies=[Policy("a", "fixed", 200_000, "", CASH_NAME), Policy("b", "fixed", 200_000, CASH_NAME)])
+        r = simulate(s, TODAY)   # 今天是 1 月 → 立即調整
+        self.assertAlmostEqual(r.rows[0].account_balances[0], 200_000, delta=1)   # 由活存補足
+        self.assertAlmostEqual(r.rows[0].account_balances[1], 200_000, delta=1)   # 超出轉活存
+        self.assertAlmostEqual(r.rows[0].free_cash, 1_000_000 - 200_000 + 300_000, delta=1)
+
+    def test_bucket_refill_source_and_overflow(self):
+        s = base(current_age=65, retire_age=65, life_expectancy=68, bucket_amount=100_000,
+                 accounts=[self.acct("a", 1_000_000), self.acct("b", 1_000_000)],
+                 policies=[Policy(BUCKET_NAME, "fixed", 0, "", "b")])
+        r = simulate(s, TODAY)
+        self.assertAlmostEqual(r.rows[0].account_balances[0], 1_000_000, delta=1)
+        self.assertAlmostEqual(r.rows[0].account_balances[1], 1_000_000 - 100_000, delta=1)
+        self.assertAlmostEqual(r.rows[0].bucket, 100_000, delta=1)
+
+    def test_property_sale_summary(self):
+        prop = Property("自宅", 10_000_000, 0, sell_age=40, sell_cost=10, purchase_price=6_000_000,
+                        sell_tax_rate=20)
+        s = base(current_age=30, retire_age=60, life_expectancy=60, properties=[prop])
+        r = simulate(s, TODAY)
+        sale = r.property_sales[0]
+        self.assertAlmostEqual(sale["price"], 10_000_000, delta=1)
+        self.assertAlmostEqual(sale["cost"], 1_000_000, delta=1)
+        self.assertAlmostEqual(sale["gain"], 3_000_000, delta=1)
+        self.assertAlmostEqual(sale["tax"], 600_000, delta=1)
+        self.assertAlmostEqual(sale["net_cash"], 8_400_000, delta=1)
+        self.assertAlmostEqual(sale["gain_after_tax"], 2_400_000, delta=1)
+
+    def test_extra_expense_stops_after_end_age(self):
+        xe = ExtraExpense("教育", 10_000, "month", 30, 35, False)
+        s = base(current_age=30, retire_age=40, life_expectancy=41, extra_expenses=[xe], savings_cash=10_000_000)
+        r = simulate(s, TODAY)
+        self.assertAlmostEqual(sum(y.extra_expense for y in r.rows), 10_000 * 60, delta=1)
+        self.assertTrue(all(y.extra_expense == 0 for y in r.rows if y.age > 35))
+
     def test_report_builds(self):
         from forecast.report import build_report
         s = base(accounts=[Account.simple("股票", 1_000_000, 0, 5, 100)], retire_age=40, life_expectancy=45,
-                 properties=[Property("自宅", 5_000_000)])
+                 properties=[Property("自宅", 5_000_000, sell_age=42, purchase_price=3_000_000)],
+                 policies=[Policy(CASH_NAME, "cap", 100_000, "股票")], salary_account="股票")
         html = build_report(s, simulate_scenarios(s, TODAY))
+        self.assertIn("不動產出售試算", html)
+        self.assertIn("帳戶規則", html)
         self.assertIn("退休收益預測報告", html)
         self.assertIn("<svg", html)
         self.assertIn("自宅", html)
