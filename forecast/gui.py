@@ -336,8 +336,8 @@ class App(tk.Tk):
     F = {
         "current_age": ("目前年齡", "歲"), "retire_age": ("預期退休年齡", "歲"),
         "life_expectancy": ("預期壽命（試算到幾歲）", "歲"),
-        "salary_net": ("實領月薪", "NT$/月"), "salary_withheld": ("每月預扣所得稅（稅款準備金）", "NT$/月"),
-        "income_growth": ("每年調薪", "%"), "income_tax_rate": ("年度結算有效稅率", "%"),
+        "salary_net": ("實領月薪", "NT$/月"), "salary_withheld": ("每月預扣所得稅（不含在實領薪水內）", "NT$/月"),
+        "income_growth": ("每年調薪", "%"), "income_tax_rate": ("年度所得稅有效稅率（占課稅所得 %）", "%"),
         "bonus_months": ("年終 / 績效獎金（實領月薪的幾個月）", "個月"), "bonus_month": ("獎金發放月份", "月"),
         "medical_start_age": ("醫療費用起算年齡", "歲"), "medical_monthly": ("起算時每月醫療費用（今日幣值）", "NT$/月"),
         "medical_growth": ("醫療費用高於通膨的年增幅", "%/年"),
@@ -519,6 +519,8 @@ class App(tk.Tk):
         if key == "flow":
             self._sync_accts()
             self._refresh_policies()
+        if key == "income":
+            self._refresh_tax_preview()
         self.pages[key].tkraise()
         self.pages[key].to_top()
         if key == "res":
@@ -605,9 +607,19 @@ class App(tk.Tk):
                    hint="以「實領月薪」輸入；每月預扣的所得稅視為稅款準備金。",
                    extra=lambda c: self._acct_field(c, "salary_account", "實領薪水 / 獎金存入帳戶"))
         self._card(right, "稅款準備金如何運作", (),
-                   hint="每年 5 月依「年度結算有效稅率」結算上一年度所得稅：課稅所得 = 薪資（實領 + 預扣）+ 年終獎金 + "
-                        "應稅的額外收入；已預扣的稅款抵繳，多退少補。\n\n"
-                        "年終獎金以實領月薪的月數計算，於指定月份發放並計入課稅所得。退休後不再有薪資。")
+                   hint="每年 5 月結算上一年度所得稅：應納稅額 = 課稅所得 × 有效稅率；課稅所得 = 薪資（實領 + 預扣）+ 年終獎金 + "
+                        "應稅的額外收入。已預扣的稅款抵繳，多退少補。\n\n"
+                        "• 「預扣所得稅」是公司每月代扣、不在實領薪水內的稅；沒有預扣就填 0，全額於 5 月補繳。\n"
+                        "• 若你已把「稅務」列在支出裡，請把預扣與稅率設為 0，避免重複計算。\n"
+                        "• 預設兩者皆為 0（不計算所得稅）。")
+        tp = Card(right, "稅款預估（第一年，依目前輸入）", self.fonts)
+        self.tax_preview = tk.Label(tp, text="", bg=C["card"], fg=C["text"], justify="left", anchor="w",
+                                    font=self.fonts["base"], wraplength=440)
+        tp.widget(self.tax_preview, sticky="w")
+        tp.pad()
+        tp.grid(sticky="ew", pady=(0, 12), row=right.grid_size()[1], column=0)
+        for k in ("salary_net", "salary_withheld", "income_tax_rate", "bonus_months"):
+            self.vars[k].trace_add("write", lambda *a: self._refresh_tax_preview())
         self.extra_tree = self._list_card(
             p, "額外收入", ("name", "amount", "ages", "g", "tax", "acct"),
             ("名稱", "金額 NT$", "期間（年齡）", "每年成長 %", "是否課稅", "存入帳戶"),
@@ -887,6 +899,7 @@ class App(tk.Tk):
         for combo, default in self.acct_combos:
             combo["values"] = self._acct_choices(default)
         self._refresh_policies()
+        self._refresh_tax_preview()
         self.acc_tree.delete(*self.acc_tree.get_children())
         for i, a in enumerate(self.s.accounts):
             self.acc_tree.insert("", "end", values=(a.name, money(a.cash), "    " + stage_summary(a.stages)),
@@ -1204,6 +1217,32 @@ class App(tk.Tk):
     # ---------- 帳戶規則 / 資金流向 ----------
     MODE_LABELS = {"none": "無規則", "cap": "上限（超過轉出）", "fixed": "固定額度（每年 1 月）"}
 
+    def _refresh_tax_preview(self):
+        if not hasattr(self, "tax_preview"):
+            return
+
+        def num(k):
+            try:
+                return float(self.vars[k].get().replace(",", "") or 0)
+            except ValueError:
+                return None
+        net, wh, rate, bm = (num(k) for k in ("salary_net", "salary_withheld", "income_tax_rate", "bonus_months"))
+        if None in (net, wh, rate, bm):
+            self.tax_preview.config(text="請先輸入有效數字")
+            return
+        s = self.s
+        extra_tax = sum(x.amount * (1 if x.freq == "year" else 12) for x in s.extra_incomes
+                        if x.taxable and x.start_age <= s.current_age < x.end_age)
+        income = (net + wh) * 12 + net * bm + extra_tax
+        tax = income * rate / 100
+        diff = wh * 12 - tax
+        word = "退稅" if diff >= 0 else "補稅"
+        self.tax_preview.config(text=(
+            f"課稅所得約 {money(income)}（薪資 {money((net + wh) * 12)}"
+            f"{'、獎金 ' + money(net * bm) if bm else ''}{'、應稅額外收入 ' + money(extra_tax) if extra_tax else ''}）\n"
+            f"應納稅額 = {money(income)} × {rate:g}% = {money(tax)}；已預扣 {money(wh * 12)}\n"
+            f"每年{word} {money(abs(diff))}（約每月 {money(abs(diff) / 12)}）"))
+
     def _sync_accts(self):
         for key, v in self.acct_vars.items():
             setattr(self.s, key, self._acct_store(v.get()))
@@ -1409,7 +1448,7 @@ class App(tk.Tk):
         inc = cf["salary"] + cf["extra"] + cf["pension"] + cf["tax"] + cf["oneoff"]
         out = (cf["living"] + cf["xexp"] + cf["insurance"] + cf["loan"] + cf["medical"] + cf["invest"])
         rows = [("收入", None, "head"), ("　實領薪水", cf["salary"], ""), ("　額外收入", cf["extra"], ""),
-                ("　年金 / 退休金月領", cf["pension"], ""), ("　稅款結算（退稅＋ / 補稅－）", cf["tax"], ""),
+                ("　年金 / 退休金月領", cf["pension"], ""), ("　所得稅（退稅＋ / 補稅－，已平均到每月）", cf["tax"], ""),
                 ("　一次性收支淨額", cf["oneoff"], ""), ("　收入合計", inc, "head"),
                 ("支出與投資", None, "head"), ("　生活支出", cf["living"], ""),
                 ("　其他固定支出（旅遊、教育、稅務…）", cf["xexp"], ""), ("　保險保費", cf["insurance"], ""),
@@ -1429,7 +1468,7 @@ class App(tk.Tk):
         cols = ["age", "income", "extra", "pension", "tax", "expense", "xexp", "oneoff", "med", "ins", "loan",
                 "invest"] + \
                [f"a{i}" for i in range(len(names))] + ["free", "bucket", "lp", "prop", "debt", "liq", "nw", "real"]
-        heads = ["年齡", "實領薪水", "額外收入", "年金/退休金月領", "稅款結算", "生活支出", "其他固定支出", "一次性收支",
+        heads = ["年齡", "實領薪水", "額外收入", "年金/退休金月領", "稅款結算（＋退稅／−補稅）", "生活支出", "其他固定支出", "一次性收支",
                  "醫療費用", "保險保費", "貸款支出", "新增投資"] + names + ["活存/現金", "生活費帳戶", "退休金專戶", "不動產", "貸款餘額",
                                                   "淨資產(不含不動產)", "淨資產", "淨資產(今日購買力)"]
         self.res_tree.configure(columns=cols)

@@ -378,6 +378,24 @@ class EngineTests(unittest.TestCase):
         r = simulate(s, TODAY)
         self.assertAlmostEqual(r.lp_at_claim, 17_000 * 12, delta=1)   # 固定金額取代比例
 
+    def test_cashflow_shows_annualized_tax(self):
+        s = base(current_age=30, retire_age=40, life_expectancy=41, salary_net=50_000, salary_withheld=5_000,
+                 income_tax_rate=15, savings_cash=1_000_000)
+        r = simulate(s, TODAY)
+        self.assertAlmostEqual(r.cashflow["tax"], -(0.15 * 660_000 - 60_000) / 12, delta=1)   # −3,250 / 月
+        self.assertAlmostEqual(r.monthly_surplus_now, 50_000 - 3_250, delta=1)
+
+    def test_duplicate_tax_warning(self):
+        s = base(current_age=30, retire_age=40, life_expectancy=41, salary_net=50_000, income_tax_rate=5,
+                 extra_expenses=[ExtraExpense("稅務", 50_000, "year", 30, 41)])
+        self.assertTrue(any("重複" in w for w in simulate(s, TODAY).warnings))
+        s.income_tax_rate = 0
+        self.assertFalse(any("重複" in w for w in simulate(s, TODAY).warnings))
+
+    def test_tax_defaults_are_off(self):
+        d = Settings()
+        self.assertEqual((d.salary_withheld, d.income_tax_rate), (0.0, 0.0))
+
     def test_report_builds(self):
         from forecast.report import build_report
         s = base(accounts=[Account.simple("股票", 1_000_000, 0, 5, 100)], retire_age=40, life_expectancy=45,

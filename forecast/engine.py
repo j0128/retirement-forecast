@@ -137,9 +137,9 @@ class Settings:
     retire_age: float = 65
     life_expectancy: float = 90
     salary_net: float = 57_000          # 實領月薪（已扣勞健保、預扣稅、自提）
-    salary_withheld: float = 3_000      # 每月預扣所得稅（稅款準備金；每年 5 月結算）
+    salary_withheld: float = 0.0        # 每月預扣所得稅（稅款準備金；每年 5 月結算）
     income_growth: float = 2.0          # 每年調薪 %（實領與預扣同步成長）
-    income_tax_rate: float = 5.0        # 年度結算有效稅率 %（課稅所得 = 薪資 + 應稅額外收入）
+    income_tax_rate: float = 0.0        # 年度結算有效稅率 %（占課稅所得的比例；課稅所得 = 薪資 + 獎金 + 應稅額外收入）
     salary_account: str = ""            # 實領薪水/獎金存入的帳戶；空白 = 預設（退休前活存）
     pension_account: str = ""           # 年金/退休金月領存入的帳戶；空白 = 預設
     expense_account: str = ""           # 生活支出、醫療、一次性支出由哪個帳戶支付；空白 = 預設
@@ -460,6 +460,7 @@ def simulate(s: Settings, today: Optional[dt.date] = None, return_delta: float =
     y_extra = y_ins = y_med = y_tax = y_xexp = y_oneoff = 0.0
     retire_nw = retire_real = 0.0
     surplus_now = None
+    fy_tax = [0.0, 0.0]   # 第一年：[預扣合計, 課稅所得合計]
     fy = {k: 0.0 for k in ("salary", "extra", "pension", "tax", "living", "xexp", "insurance", "loan", "medical",
                            "oneoff", "invest")}
     names = [a.name for a in accs]
@@ -748,7 +749,9 @@ def simulate(s: Settings, today: Optional[dt.date] = None, return_delta: float =
         flow[1] += invested   # 每月投資加碼一律由預設現金流支應
         outflow = expense + medical + insurance + loan_paid + extra_exp + one_out
         if m < 12:
-            for k_, v_ in (("salary", net_salary), ("extra", extra), ("pension", pension), ("tax", tax_settle),
+            fy_tax[0] += withheld
+            fy_tax[1] += taxable_inc
+            for k_, v_ in (("salary", net_salary), ("extra", extra), ("pension", pension), ("tax", 0.0),
                            ("living", expense), ("xexp", extra_exp), ("insurance", insurance),
                            ("loan", loan_paid), ("medical", medical), ("oneoff", one_in - one_out),
                            ("invest", invested)):
@@ -823,9 +826,13 @@ def simulate(s: Settings, today: Optional[dt.date] = None, return_delta: float =
         warnings.append("勞退請領年齡早於退休年齡，已視為退休時才請領")
     n_fy = max(min(12, total_m), 1)
     cashflow = {k: v / n_fy for k, v in fy.items()}
+    # 稅款：以第一年的預扣與課稅所得換算成「平均每月」的退稅（＋）或補稅（−），而非實際結算月份的金額
+    cashflow["tax"] = (fy_tax[0] - fy_tax[1] * s.income_tax_rate / 100) / n_fy
     surplus_now = (cashflow["salary"] + cashflow["extra"] + cashflow["pension"] + cashflow["tax"]
                    + cashflow["oneoff"] - cashflow["living"] - cashflow["xexp"] - cashflow["insurance"]
                    - cashflow["loan"] - cashflow["medical"] - cashflow["invest"])
+    if (s.salary_withheld > 0 or s.income_tax_rate > 0) and any("稅" in x.name for x in s.extra_expenses):
+        warnings.append("你同時設定了所得稅結算（預扣 / 稅率），又有名稱含「稅」的支出，稅款可能被重複計算")
     if surplus_now < 0 and s.retire_age > s.current_age:
         warnings.append("目前每月現金流為負，不足部分會動用活存/投資帳戶")
     return Result(rows=rows, account_names=[a.name for a in accs],
