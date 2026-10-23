@@ -84,6 +84,9 @@ def build_report(s: Settings, results: dict) -> str:
         ("實領月薪（預扣所得稅）", f"NT$ {money(s.salary_net)}（{money(s.salary_withheld)}）；年調薪 {s.income_growth:g}%"),
         ("年終獎金", f"{s.bonus_months:g} 個月（{int(s.bonus_month)} 月發放）" if s.bonus_months else "無"),
         ("每月生活支出（今日幣值）", f"目前 {money(s.monthly_expense)}；退休後 {money(s.retire_expense)}"),
+        ("所得稅", ("台灣綜合所得稅級距（官方稅率表" + ("，有配偶合併申報" if s.tax_married else "，單身")
+                    + f"，扶養 {s.tax_dependents + s.tax_elders:g} 人）") if s.tax_mode == "bracket"
+         else f"有效稅率 {s.income_tax_rate:g}%，預扣 {money(s.salary_withheld)}/月"),
         ("通膨 / 活存利率", f"{s.inflation:g}% / {s.savings_rate:g}%"),
         ("投資帳戶", "、".join(f"{a.name}（{money(a.cash)}）" for a in s.accounts) or "無"),
         ("額外收入", "、".join(f"{x.name}（{money(x.amount)}/{'年' if x.freq == 'year' else '月'}，"

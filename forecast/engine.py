@@ -5,6 +5,8 @@ import datetime as dt
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 
+from . import tax as taxmod
+
 LABOR_PENSION_WAGE_CAP = 150_000  # 勞退提繳工資上限（預設，可在設定中調整）
 CASH = "活存"            # 內建帳戶名稱：活存/現金
 BUCKET = "生活費帳戶"      # 內建帳戶名稱：退休後生活費帳戶
@@ -67,6 +69,7 @@ class ExtraIncome:
     growth: float = 0.0          # 每年成長 %
     taxable: bool = True         # 是否計入年度所得稅
     account: str = ""            # 收入存入哪個帳戶；空白 = 預設
+    kind: str = "salary"         # 所得類別（級距模式用）：salary 薪資/兼職、rent 租金（扣 43% 費用）、other 其他
 
 
 @dataclass
@@ -140,6 +143,13 @@ class Settings:
     salary_withheld: float = 0.0        # 每月預扣所得稅（稅款準備金；每年 5 月結算）
     income_growth: float = 2.0          # 每年調薪 %（實領與預扣同步成長）
     income_tax_rate: float = 0.0        # 年度結算有效稅率 %（占課稅所得的比例；課稅所得 = 薪資 + 獎金 + 應稅額外收入）
+    tax_mode: str = "rate"              # rate = 有效稅率；bracket = 台灣綜合所得稅級距（依官方稅率表）
+    tax_married: bool = False           # 級距模式：有配偶（合併申報，配偶無其他所得）
+    tax_dependents: float = 0           # 級距模式：扶養親屬人數（不含 70 歲以上）
+    tax_elders: float = 0               # 級距模式：70 歲以上扶養親屬人數
+    tax_itemized: float = 0.0           # 級距模式：列舉扣除額（年）；0 = 用標準扣除額，高於標準才採用
+    tax_other_deduction: float = 0.0    # 級距模式：其他特別扣除額（年；儲蓄投資、幼兒學前、長照等）
+    tax_index: bool = True              # 級距模式：公告年度之後的稅制參數隨通膨調整
     salary_account: str = ""            # 實領薪水/獎金存入的帳戶；空白 = 預設（退休前活存）
     pension_account: str = ""           # 年金/退休金月領存入的帳戶；空白 = 預設
     expense_account: str = ""           # 生活支出、醫療、一次性支出由哪個帳戶支付；空白 = 預設
@@ -452,6 +462,16 @@ def simulate(s: Settings, today: Optional[dt.date] = None, return_delta: float =
         k = now_abs + m - ls["a"]
         return max(ls["n"] - max(k, 0), 0) * ls["pay"]
 
+    def year_tax(comp, roc_year, age_end):
+        """一個所得年度的應納稅額。comp = [預扣, 課稅所得合計, 薪資, 租金, 其他]（已年化）。"""
+        if s.tax_mode == "bracket":
+            tb = taxmod.table_for(roc_year, s.inflation, s.tax_index)
+            return taxmod.income_tax(
+                tb, salary=comp[2], rent=comp[3], other=comp[4], married=s.tax_married,
+                dependents=s.tax_dependents, elders=s.tax_elders, taxpayer_70=age_end >= 70,
+                itemized=s.tax_itemized, other_deduction=s.tax_other_deduction)["tax"]
+        return comp[1] * s.income_tax_rate / 100
+
     warnings = []
     rows = []
     property_sales = []
@@ -460,7 +480,7 @@ def simulate(s: Settings, today: Optional[dt.date] = None, return_delta: float =
     y_extra = y_ins = y_med = y_tax = y_xexp = y_oneoff = 0.0
     retire_nw = retire_real = 0.0
     surplus_now = None
-    fy_tax = [0.0, 0.0]   # 第一年：[預扣合計, 課稅所得合計]
+    fy_tax = [0.0] * 5   # 第一年：[預扣, 課稅所得合計, 薪資, 租金, 其他]
     fy = {k: 0.0 for k in ("salary", "extra", "pension", "tax", "living", "xexp", "insurance", "loan", "medical",
                            "oneoff", "invest")}
     names = [a.name for a in accs]
@@ -620,11 +640,13 @@ def simulate(s: Settings, today: Optional[dt.date] = None, return_delta: float =
         # 收入：實領薪水（預扣所得稅另列入稅款準備金）、額外收入
         net_salary = withheld = 0.0
         taxable_inc = 0.0
+        sal_inc = rent_inc = oth_inc = 0.0
         if not retired:
             gf = (1 + s.income_growth / 100) ** yr
             net_salary = s.salary_net * gf
             withheld = s.salary_withheld * gf
             taxable_inc = net_salary + withheld
+            sal_inc = taxable_inc
             if s.lp_enabled:
                 if s.lp_monthly_add > 0:
                     lp += s.lp_monthly_add
@@ -636,6 +658,7 @@ def simulate(s: Settings, today: Optional[dt.date] = None, return_delta: float =
             bonus = net_salary * s.bonus_months
             net_salary += bonus
             taxable_inc += bonus
+            sal_inc += bonus
         extra = 0.0
         for x in s.extra_incomes:
             if x.start_age <= age < x.end_age:
@@ -644,14 +667,25 @@ def simulate(s: Settings, today: Optional[dt.date] = None, return_delta: float =
                 route_in(amt, x.account)
                 if x.taxable:
                     taxable_inc += amt
+                    if x.kind == "rent":
+                        rent_inc += amt
+                    elif x.kind == "other":
+                        oth_inc += amt
+                    else:
+                        sal_inc += amt
         route_in(net_salary, s.salary_account)
-        ty = tax_year.setdefault(cal_year, [0.0, 0.0])
-        ty[0] += withheld
-        ty[1] += taxable_inc
+        ty = tax_year.setdefault(cal_year, [0.0, 0.0, 0.0, 0.0, 0.0, 0, 0.0])
+        for i_, v_ in enumerate((withheld, taxable_inc, sal_inc, rent_inc, oth_inc)):
+            ty[i_] += v_
+        ty[5] += 1          # 已累計的月數
+        ty[6] = age         # 該年度最後記錄的年齡
         tax_settle = 0.0
         if cal_month == 5 and (cal_year - 1) in tax_year:  # 每年 5 月結算上一年度所得稅（多退少補）
-            w_, inc_ = tax_year.pop(cal_year - 1)
-            tax_settle = w_ - inc_ * s.income_tax_rate / 100
+            comp = tax_year.pop(cal_year - 1)
+            n_mo = comp[5]
+            if (cal_year - 1) == today.year and n_mo < 12:   # 首年只有部分月份：以相同水準年化，才能套用整年度的免稅額與扣除額
+                comp = [v_ * 12 / n_mo for v_ in comp[:5]] + [12, comp[6]]
+            tax_settle = comp[0] - year_tax(comp, cal_year - 1 - 1911, comp[6])
             if tax_settle >= 0:
                 flow[0] += tax_settle
             else:
@@ -749,8 +783,8 @@ def simulate(s: Settings, today: Optional[dt.date] = None, return_delta: float =
         flow[1] += invested   # 每月投資加碼一律由預設現金流支應
         outflow = expense + medical + insurance + loan_paid + extra_exp + one_out
         if m < 12:
-            fy_tax[0] += withheld
-            fy_tax[1] += taxable_inc
+            for i_, v_ in enumerate((withheld, taxable_inc, sal_inc, rent_inc, oth_inc)):
+                fy_tax[i_] += v_
             for k_, v_ in (("salary", net_salary), ("extra", extra), ("pension", pension), ("tax", 0.0),
                            ("living", expense), ("xexp", extra_exp), ("insurance", insurance),
                            ("loan", loan_paid), ("medical", medical), ("oneoff", one_in - one_out),
@@ -827,11 +861,13 @@ def simulate(s: Settings, today: Optional[dt.date] = None, return_delta: float =
     n_fy = max(min(12, total_m), 1)
     cashflow = {k: v / n_fy for k, v in fy.items()}
     # 稅款：以第一年的預扣與課稅所得換算成「平均每月」的退稅（＋）或補稅（−），而非實際結算月份的金額
-    cashflow["tax"] = (fy_tax[0] - fy_tax[1] * s.income_tax_rate / 100) / n_fy
+    fy_comp = [v_ * 12 / n_fy for v_ in fy_tax]
+    cashflow["tax"] = (fy_comp[0] - year_tax(fy_comp, today.year - 1911, s.current_age)) / 12
     surplus_now = (cashflow["salary"] + cashflow["extra"] + cashflow["pension"] + cashflow["tax"]
                    + cashflow["oneoff"] - cashflow["living"] - cashflow["xexp"] - cashflow["insurance"]
                    - cashflow["loan"] - cashflow["medical"] - cashflow["invest"])
-    if (s.salary_withheld > 0 or s.income_tax_rate > 0) and any("稅" in x.name for x in s.extra_expenses):
+    if (s.salary_withheld > 0 or s.income_tax_rate > 0 or s.tax_mode == "bracket") \
+            and any("稅" in x.name for x in s.extra_expenses):
         warnings.append("你同時設定了所得稅結算（預扣 / 稅率），又有名稱含「稅」的支出，稅款可能被重複計算")
     if surplus_now < 0 and s.retire_age > s.current_age:
         warnings.append("目前每月現金流為負，不足部分會動用活存/投資帳戶")

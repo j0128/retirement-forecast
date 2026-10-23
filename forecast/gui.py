@@ -15,6 +15,7 @@ from .engine import (BUCKET, CASH, Account, ExtraExpense, ExtraIncome, Insurance
                      Result, Settings, Stage, from_dict, simulate_scenarios, to_dict)
 from .fmt import money, nice_ticks, num_str, short_money
 from .report import build_report
+from . import tax as taxmod
 
 # ---------- 配色 ----------
 C = {
@@ -32,6 +33,17 @@ def settings_path() -> str:
     base = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) \
         else os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base, "retirement_settings.json")
+
+
+def datetime_year() -> int:
+    return dt.date.today().year
+
+
+def num_infl(app) -> float:
+    try:
+        return float(app.vars["inflation"].get().replace(",", "") or 0)
+    except (ValueError, KeyError):
+        return 2.0
 
 
 def stage_summary(stages) -> str:
@@ -139,9 +151,12 @@ class Card(tk.Frame):
         ttk.Label(self, text=label, style="Card.TLabel").grid(row=self.row, column=0, sticky="w",
                                                               padx=(16, 10), pady=5)
         w = widget or ttk.Entry(self, textvariable=var, width=width, justify="right")
-        w.grid(row=self.row, column=1, sticky="e", pady=5)
-        ttk.Label(self, text=unit, style="Unit.TLabel", width=7).grid(row=self.row, column=2, sticky="w",
-                                                                      padx=(6, 14))
+        if widget is not None and not unit:   # 下拉選單：橫跨「欄位 + 單位」兩欄，避免被擠窄
+            w.grid(row=self.row, column=1, columnspan=2, sticky="e", padx=(0, 14), pady=5)
+        else:
+            w.grid(row=self.row, column=1, sticky="e", pady=5)
+            ttk.Label(self, text=unit, style="Unit.TLabel", width=7).grid(row=self.row, column=2, sticky="w",
+                                                                          padx=(6, 14))
         self.row += 1
         return w
 
@@ -339,6 +354,9 @@ class App(tk.Tk):
         "salary_net": ("實領月薪", "NT$/月"), "salary_withheld": ("每月預扣所得稅（不含在實領薪水內）", "NT$/月"),
         "income_growth": ("每年調薪", "%"), "income_tax_rate": ("年度所得稅有效稅率（占課稅所得 %）", "%"),
         "bonus_months": ("年終 / 績效獎金（實領月薪的幾個月）", "個月"), "bonus_month": ("獎金發放月份", "月"),
+        "tax_dependents": ("扶養親屬人數（不含 70 歲以上）", "人"), "tax_elders": ("其中 70 歲以上的扶養人數", "人"),
+        "tax_itemized": ("列舉扣除額（0 = 用標準扣除額）", "NT$/年"),
+        "tax_other_deduction": ("其他特別扣除額（儲蓄投資、幼兒學前、長照…）", "NT$/年"),
         "medical_start_age": ("醫療費用起算年齡", "歲"), "medical_monthly": ("起算時每月醫療費用（今日幣值）", "NT$/月"),
         "medical_growth": ("醫療費用高於通膨的年增幅", "%/年"),
         "scenario_delta": ("悲觀 / 樂觀：投資報酬率 ∓", "百分點"),
@@ -372,6 +390,7 @@ class App(tk.Tk):
         self.geometry(f"{w}x{h}+{(sw - w) // 2}+{max((sh - h) // 2 - 20, 0)}")
         self.minsize(min(980, w), min(620, h))
         self.fonts = setup_style(self)
+        taxmod.load_overrides(os.path.join(os.path.dirname(settings_path()), "tax_tables.json"))
         self.s = Settings()
         self.result: Result | None = None
         self.results: dict = {}
@@ -383,6 +402,7 @@ class App(tk.Tk):
         self.nav_items: dict = {}
         self.acct_vars: dict[str, tk.StringVar] = {}
         self.acct_combos: list = []
+        self.choice_fields: dict = {}
         self.current_page = None
         self._build()
         self.bind_all("<MouseWheel>", self._wheel)
@@ -562,6 +582,21 @@ class App(tk.Tk):
         self.acct_combos.append((combo, default))
         card.field(label, None, "", widget=combo)
 
+    def _choice_field(self, card, key, label, mapping):
+        """下拉選單欄位：mapping = {設定值: 顯示文字}。"""
+        var = tk.StringVar()
+        self.choice_fields[key] = (var, mapping)
+        ttk.Label(card, text=label, style="Card.TLabel").grid(row=card.row, column=0, columnspan=3, sticky="w",
+                                                              padx=16, pady=(6, 0))
+        card.row += 1
+        combo = ttk.Combobox(card, textvariable=var, state="readonly", values=list(mapping.values()))
+        combo.grid(row=card.row, column=0, columnspan=3, sticky="ew", padx=16, pady=(2, 6))
+        card.row += 1
+        var.trace_add("write", lambda *a: self._refresh_tax_preview())
+
+    TAX_MODES = {"rate": "有效稅率（自行輸入）", "bracket": "台灣綜所稅級距（官方稅率表）"}
+    TAX_FILING = {False: "單身", True: "有配偶（合併申報）"}
+
     def _card(self, parent, title, keys=(), hint=None, extra=None):
         cd = Card(parent, title, self.fonts, hint=hint)
         for k in keys:
@@ -606,6 +641,20 @@ class App(tk.Tk):
                    ("salary_net", "salary_withheld", "income_growth", "income_tax_rate", "bonus_months", "bonus_month"),
                    hint="以「實領月薪」輸入；每月預扣的所得稅視為稅款準備金。",
                    extra=lambda c: self._acct_field(c, "salary_account", "實領薪水 / 獎金存入帳戶"))
+        mc = Card(left, "所得稅計算方式", self.fonts,
+                  hint="選「台灣綜所稅級距」時，依官方累進稅率、免稅額與扣除額，用你每年的所得算出稅額；"
+                       "上方「有效稅率」欄位不使用。")
+        self._choice_field(mc, "tax_mode", "計算方式", self.TAX_MODES)
+        self._choice_field(mc, "tax_married", "申報身分", self.TAX_FILING)
+        for k in ("tax_dependents", "tax_elders", "tax_itemized", "tax_other_deduction"):
+            self._money_entry(mc, k)
+        self.vars["tax_index"] = tk.BooleanVar()
+        mc.widget(ttk.Checkbutton(mc, text="公告年度之後，免稅額與扣除額、級距隨通膨調整", variable=self.vars["tax_index"]),
+                  pady=(2, 2))
+        self.tax_table_info = tk.Label(mc, text="", bg=C["card"], fg=C["muted"], justify="left", anchor="w",
+                                       font=self.fonts["small"], wraplength=440)
+        mc.widget(self.tax_table_info, sticky="w", pady=(2, 10))
+        mc.grid(sticky="ew", pady=(0, 12), row=left.grid_size()[1], column=0)
         self._card(right, "稅款準備金如何運作", (),
                    hint="每年 5 月結算上一年度所得稅：應納稅額 = 課稅所得 × 有效稅率；課稅所得 = 薪資（實領 + 預扣）+ 年終獎金 + "
                         "應稅的額外收入。已預扣的稅款抵繳，多退少補。\n\n"
@@ -618,11 +667,12 @@ class App(tk.Tk):
         tp.widget(self.tax_preview, sticky="w")
         tp.pad()
         tp.grid(sticky="ew", pady=(0, 12), row=right.grid_size()[1], column=0)
-        for k in ("salary_net", "salary_withheld", "income_tax_rate", "bonus_months"):
+        for k in ("salary_net", "salary_withheld", "income_tax_rate", "bonus_months", "tax_dependents", "tax_elders",
+                  "tax_itemized", "tax_other_deduction"):
             self.vars[k].trace_add("write", lambda *a: self._refresh_tax_preview())
         self.extra_tree = self._list_card(
             p, "額外收入", ("name", "amount", "ages", "g", "tax", "acct"),
-            ("名稱", "金額 NT$", "期間（年齡）", "每年成長 %", "是否課稅", "存入帳戶"),
+            ("名稱", "金額 NT$", "期間（年齡）", "每年成長 %", "課稅類別", "存入帳戶"),
             self.add_extra, self.edit_extra, self.del_extra,
             note="薪水以外的收入：兼職、租金、股利、顧問費等；年金額平均分攤到每月，可設定期間與成長率，退休後仍可持續。",
             widths=(180, 190, 160, 120, 100, 150), height=6)
@@ -876,6 +926,8 @@ class App(tk.Tk):
                 v.set(f"{val:g}" if isinstance(val, float) else str(val))
         for key, v in self.acct_vars.items():
             v.set(self._acct_label(getattr(s, key), self._acct_choices(True), True))
+        for key, (var, mapping) in self.choice_fields.items():
+            var.set(mapping.get(getattr(s, key), next(iter(mapping.values()))))
         self._refresh_lists()
 
     def _from_form(self) -> Settings:
@@ -893,6 +945,8 @@ class App(tk.Tk):
                     raise ValueError(f"「{self.F.get(key, (key,))[0]}」不是有效數字：{raw}")
         for key, v in self.acct_vars.items():
             setattr(s, key, self._acct_store(v.get()))
+        for key, (var, mapping) in self.choice_fields.items():
+            setattr(s, key, next((k for k, lab in mapping.items() if lab == var.get()), getattr(s, key)))
         return s
 
     def _refresh_lists(self):
@@ -932,7 +986,7 @@ class App(tk.Tk):
             amt = f"{money(x.amount)} / {'年' if x.freq == 'year' else '月'}"
             self.extra_tree.insert("", "end", tags=("odd" if i % 2 else "even",),
                                    values=(x.name, amt, f"{x.start_age:g}–{x.end_age:g} 歲", f"{x.growth:g}",
-                                           "是" if x.taxable else "否", x.account or "預設"))
+                                           (self.KIND_LABELS.get(x.kind, "")[:2] if x.taxable else "否"), x.account or "預設"))
 
         self.xexp_tree.delete(*self.xexp_tree.get_children())
         for i, x in enumerate(self.s.extra_expenses):
@@ -1167,12 +1221,15 @@ class App(tk.Tk):
             ("start_age", "起始年齡", "num", x.start_age), ("end_age", "結束年齡（到該歲生日前為止）", "num", x.end_age),
             ("growth", "每年成長 %", "num", x.growth),
             ("taxable", "是否計入所得稅", "choice", "是" if x.taxable else "否", ["是", "否"]),
+            ("kind", "所得類別（級距模式用）", "choice", self.KIND_LABELS.get(x.kind, self.KIND_LABELS["salary"]),
+             list(self.KIND_LABELS.values())),
             ("account", "收入存入哪個帳戶", "choice", self._acct_label(x.account, ch, True), ch)])
         if not d.result:
             return None
         r = d.result
         r["freq"] = "year" if r["freq"] == "每年" else "month"
         r["taxable"] = r["taxable"] == "是"
+        r["kind"] = next(k for k, v in self.KIND_LABELS.items() if v == r["kind"])
         r["account"] = self._acct_store(r["account"])
         return ExtraIncome(**r)
 
@@ -1217,8 +1274,10 @@ class App(tk.Tk):
     # ---------- 帳戶規則 / 資金流向 ----------
     MODE_LABELS = {"none": "無規則", "cap": "上限（超過轉出）", "fixed": "固定額度（每年 1 月）"}
 
+    KIND_LABELS = {"salary": "薪資 / 兼職", "rent": "租金（扣 43% 費用）", "other": "其他全額課稅"}
+
     def _refresh_tax_preview(self):
-        if not hasattr(self, "tax_preview"):
+        if not hasattr(self, "tax_preview") or len(self.choice_fields) < 2:
             return
 
         def num(k):
@@ -1226,20 +1285,55 @@ class App(tk.Tk):
                 return float(self.vars[k].get().replace(",", "") or 0)
             except ValueError:
                 return None
-        net, wh, rate, bm = (num(k) for k in ("salary_net", "salary_withheld", "income_tax_rate", "bonus_months"))
-        if None in (net, wh, rate, bm):
+        keys = ("salary_net", "salary_withheld", "income_tax_rate", "bonus_months", "tax_dependents", "tax_elders",
+                "tax_itemized", "tax_other_deduction")
+        net, wh, rate, bm, dep, eld, item, oth_d = (num(k) for k in keys)
+        if None in (net, wh, rate, bm, dep, eld, item, oth_d):
             self.tax_preview.config(text="請先輸入有效數字")
             return
         s = self.s
-        extra_tax = sum(x.amount * (1 if x.freq == "year" else 12) for x in s.extra_incomes
-                        if x.taxable and x.start_age <= s.current_age < x.end_age)
-        income = (net + wh) * 12 + net * bm + extra_tax
+        mode = next((k for k, v in self.TAX_MODES.items() if v == self.choice_fields["tax_mode"][0].get()), "rate")
+        married = self.choice_fields["tax_married"][0].get() == self.TAX_FILING[True]
+        sal = (net + wh) * 12 + net * bm
+        rent = other = 0.0
+        for x in s.extra_incomes:
+            if x.taxable and x.start_age <= s.current_age < x.end_age:
+                amt = x.amount * (1 if x.freq == "year" else 12)
+                if x.kind == "rent":
+                    rent += amt
+                elif x.kind == "other":
+                    other += amt
+                else:
+                    sal += amt
+        year = datetime_year() - 1911
+        index = bool(self.vars["tax_index"].get())
+        tb = taxmod.table_for(year, num_infl(self), index)
+        self.tax_table_info.config(text=(
+            f"採用 {tb.year} 年度稅率表（{tb.year + 1911} 年所得）：免稅額 {money(tb.exemption)}（70 歲以上 "
+            f"{money(tb.exemption_70)}）、標準扣除額 {money(tb.std_single)}／有配偶 {money(tb.std_married)}、"
+            f"薪資特別扣除額 {money(tb.salary_deduction)}。級距上限 "
+            + "、".join(money(u) for u, _ in tb.brackets[:-1]) + "。不含基本稅額、基本生活費差額、股利／利息分離課稅。"))
+        if mode == "bracket":
+            r = taxmod.income_tax(tb, salary=sal, rent=rent, other=other, married=married, dependents=dep,
+                                  elders=eld, taxpayer_70=s.current_age >= 70, itemized=item, other_deduction=oth_d)
+            tax = r["tax"]
+            diff = wh * 12 - tax
+            word = "退稅" if diff >= 0 else "補稅"
+            self.tax_preview.config(text=(
+                f"所得：薪資 {money(sal)}" + (f"、租金（扣 43% 後）{money(r['rent_net'])}" if rent else "")
+                + (f"、其他 {money(other)}" if other else "") + "\n"
+                f"− 免稅額 {money(r['exemptions'])} − 扣除額 {money(r['deduction'])} − 薪資特別扣除額 "
+                f"{money(r['salary_deduction'])}" + (f" − 其他特別扣除額 {money(oth_d)}" if oth_d else "") + "\n"
+                f"= 所得淨額 {money(r['net_income'])}，最高適用 {r['marginal']:g}% 級距\n"
+                f"應納稅額 {money(tax)}（有效稅率 {r['effective']:.1%}）；已預扣 {money(wh * 12)}\n"
+                f"每年{word} {money(abs(diff))}（約每月 {money(abs(diff) / 12)}）"))
+            return
+        income = sal + rent + other
         tax = income * rate / 100
         diff = wh * 12 - tax
         word = "退稅" if diff >= 0 else "補稅"
         self.tax_preview.config(text=(
-            f"課稅所得約 {money(income)}（薪資 {money((net + wh) * 12)}"
-            f"{'、獎金 ' + money(net * bm) if bm else ''}{'、應稅額外收入 ' + money(extra_tax) if extra_tax else ''}）\n"
+            f"課稅所得約 {money(income)}\n"
             f"應納稅額 = {money(income)} × {rate:g}% = {money(tax)}；已預扣 {money(wh * 12)}\n"
             f"每年{word} {money(abs(diff))}（約每月 {money(abs(diff) / 12)}）"))
 
