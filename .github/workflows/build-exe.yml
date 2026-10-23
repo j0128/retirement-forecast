@@ -2,6 +2,8 @@ name: build-exe
 on:
   push:
   workflow_dispatch:
+permissions:
+  contents: write
 jobs:
   build:
     runs-on: windows-latest
@@ -18,3 +20,15 @@ jobs:
         with:
           name: RetirementForecast-exe
           path: dist/RetirementForecast.exe
+      # 固定的下載頁：Releases 的「latest」，每次建置成功後更新為最新版 exe
+      - name: Publish latest release
+        if: github.ref == 'refs/heads/main'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest dist/RetirementForecast.exe \
+            --title "最新版（${GITHUB_SHA::7}）" \
+            --notes "由 GitHub Actions 自動建置。下載 RetirementForecast.exe 後雙擊即可執行；設定會存在 exe 旁邊的 retirement_settings.json。" \
+            --target "$GITHUB_SHA" --latest

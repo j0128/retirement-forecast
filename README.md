@@ -3,7 +3,8 @@
 Windows 桌面程式（tkinter），輸入年齡、收入、投資帳戶、貸款、勞退與勞保，預測逐年淨資產與退休後資金可撐多久。幣別：新台幣。
 
 ## 取得 exe
-到 GitHub **Actions → build-exe → 最新一次執行 → Artifacts → RetirementForecast-exe** 下載。
+到 GitHub 的 **Releases → 最新版（latest）** 下載 `RetirementForecast.exe`，每次建置成功後會自動更新。
+也可以從 **Actions → build-exe → 最新一次執行 → Artifacts → RetirementForecast-exe** 下載（zip，保留 90 天）。
 設定會自動存成 exe 旁的 `retirement_settings.json`（內含個人財務資料，已列入 .gitignore，請勿上傳）。
 
 ## 本機執行
